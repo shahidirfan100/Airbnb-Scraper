@@ -1,0 +1,44 @@
+{
+  "title": "Airbnb Listings Scraper",
+  "description": "Extract Airbnb listings and property details via API using a search URL.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "url": {
+      "title": "Airbnb Search URL",
+      "type": "string",
+      "description": "Preferred input. Any Airbnb search URL from /s/.../homes is supported.",
+      "editor": "textfield",
+      "prefill": "https://www.airbnb.com/s/London--United-Kingdom/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1"
+    },
+    "results_wanted": {
+      "title": "Results wanted",
+      "type": "integer",
+      "description": "Maximum number of listings to save.",
+      "minimum": 1,
+      "default": 20,
+      "prefill": 20,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum pages",
+      "type": "integer",
+      "description": "Safety cap for API pagination loops.",
+      "minimum": 1,
+      "default": 5,
+      "prefill": 5,
+      "editor": "number"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Use Apify Proxy for reliable access.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": false
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

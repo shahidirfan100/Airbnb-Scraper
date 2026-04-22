@@ -1,0 +1,229 @@
+{
+  "actorSpecification": 1,
+  "fields": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "listing_id": {
+        "title": "Listing ID",
+        "type": "string",
+        "description": "Airbnb listing numeric identifier."
+      },
+      "listing_url": {
+        "title": "Listing URL",
+        "type": "string",
+        "description": "Airbnb listing URL."
+      },
+      "title": {
+        "title": "Title",
+        "type": "string",
+        "description": "Listing title."
+      },
+      "subtitle": {
+        "title": "Subtitle",
+        "type": "string",
+        "description": "Listing subtitle."
+      },
+      "name_localized": {
+        "title": "Localized Name",
+        "type": "string",
+        "description": "Localized listing name from search payload."
+      },
+      "room_type": {
+        "title": "Room Type",
+        "type": "string",
+        "description": "Property room or home type."
+      },
+      "city": {
+        "title": "City",
+        "type": "string",
+        "description": "Localized city."
+      },
+      "category": {
+        "title": "Category",
+        "type": "string",
+        "description": "Airbnb room or property category label."
+      },
+      "bed_label": {
+        "title": "Bed Label",
+        "type": "string",
+        "description": "Short bed or room summary label."
+      },
+      "person_capacity": {
+        "title": "Person Capacity",
+        "type": "number",
+        "description": "Maximum number of guests."
+      },
+      "is_superhost": {
+        "title": "Is Superhost",
+        "type": "boolean",
+        "description": "Whether the host is marked as superhost."
+      },
+      "host_name": {
+        "title": "Host Name",
+        "type": "string",
+        "description": "Host name when available."
+      },
+      "latitude": {
+        "title": "Latitude",
+        "type": "number",
+        "description": "Listing latitude."
+      },
+      "longitude": {
+        "title": "Longitude",
+        "type": "number",
+        "description": "Listing longitude."
+      },
+      "rating": {
+        "title": "Rating",
+        "type": "number",
+        "description": "Average rating score."
+      },
+      "reviews_count": {
+        "title": "Reviews Count",
+        "type": "number",
+        "description": "Number of reviews."
+      },
+      "rating_label": {
+        "title": "Rating Label",
+        "type": "string",
+        "description": "Accessibility rating label from Airbnb."
+      },
+      "nightly_price": {
+        "title": "Nightly Price",
+        "type": "string",
+        "description": "Primary nightly price text."
+      },
+      "nightly_price_qualifier": {
+        "title": "Nightly Price Qualifier",
+        "type": "string",
+        "description": "Nightly price qualifier text."
+      },
+      "price_accessibility_label": {
+        "title": "Price Accessibility Label",
+        "type": "string",
+        "description": "Accessibility-friendly price text."
+      },
+      "total_price_line": {
+        "title": "Total Price Line",
+        "type": "string",
+        "description": "Secondary total price line."
+      },
+      "price_display_style": {
+        "title": "Price Display Style",
+        "type": "string",
+        "description": "Price presentation style."
+      },
+      "review_snippet": {
+        "title": "Review Snippet",
+        "type": "string",
+        "description": "Short review snippet from listing card."
+      },
+      "badges": {
+        "title": "Badges",
+        "type": "array",
+        "description": "Listing badge labels.",
+        "items": {
+          "type": "string"
+        }
+      },
+      "image_urls": {
+        "title": "Image URLs",
+        "type": "array",
+        "description": "Image URLs from listing card visuals.",
+        "items": {
+          "type": "string"
+        }
+      },
+      "search_rank": {
+        "title": "Search Rank",
+        "type": "number",
+        "description": "Rank order in collected search results."
+      },
+      "search_context": {
+        "title": "Search Context",
+        "type": "string",
+        "description": "Input context used for the run."
+      },
+      "fetched_at": {
+        "title": "Fetched At",
+        "type": "string",
+        "description": "Timestamp when item was collected."
+      }
+    }
+  },
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "listing_id",
+          "listing_url",
+          "title",
+          "city",
+          "room_type",
+          "person_capacity",
+          "rating",
+          "reviews_count",
+          "nightly_price",
+          "nightly_price_qualifier",
+          "search_rank",
+          "fetched_at"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "listing_id": {
+            "label": "Listing ID",
+            "format": "text"
+          },
+          "listing_url": {
+            "label": "Listing URL",
+            "format": "link"
+          },
+          "title": {
+            "label": "Title",
+            "format": "text"
+          },
+          "city": {
+            "label": "City",
+            "format": "text"
+          },
+          "room_type": {
+            "label": "Room Type",
+            "format": "text"
+          },
+          "person_capacity": {
+            "label": "Guests",
+            "format": "number"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "number"
+          },
+          "reviews_count": {
+            "label": "Reviews",
+            "format": "number"
+          },
+          "nightly_price": {
+            "label": "Nightly Price",
+            "format": "text"
+          },
+          "nightly_price_qualifier": {
+            "label": "Price Qualifier",
+            "format": "text"
+          },
+          "search_rank": {
+            "label": "Rank",
+            "format": "number"
+          },
+          "fetched_at": {
+            "label": "Fetched At",
+            "format": "text"
+          }
+        }
+      }
+    }
+  }
+}

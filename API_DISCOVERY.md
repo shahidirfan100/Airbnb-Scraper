@@ -1,0 +1,46 @@
+## Selected API: Listings And Property Data
+
+- Endpoint: https://www.airbnb.com/api/v3/StaysSearch
+- Method: GET
+- Auth:
+  - Required header: x-airbnb-api-key (read from Airbnb bootstrap api_config.key)
+  - Required persisted query extension with sha256 hash
+- Operation name: StaysSearch
+- Operation ID: 753d97c7b19a1a402d2fa63882ff4d6802004d11f2499647deef923a19a1641a
+- Pagination:
+  - results.paginationInfo.nextPageCursor
+  - cursor decodes to section_offset and items_offset
+  - request rawParams must use camelCase keys: sectionOffset and itemsOffset
+- Field count: 25+ listing/property fields per result item
+
+### Fields available (non-exhaustive)
+
+- propertyId, demandStayListing.id, title, subtitle, nameLocalized
+- demandStayListing.homeType, localizedCity, roomAndPropertyType, personCapacity
+- demandStayListing.hostProfile fields, coordinate fields
+- structuredDisplayPrice primary and secondary price lines
+- badges, contextualPictures, rating labels
+- paginationInfo cursors
+
+## URLScan and candidate analysis
+
+- URLScan search was attempted for Airbnb search routes.
+- Public scans did not reliably expose complete persisted query metadata.
+- Runtime bootstrap payload and API replay were used to validate the working API contract.
+
+## Why weaker candidates were rejected
+
+- HTML selectors: Rejected to avoid brittle markup parsing and to keep actor API-first.
+- Reviews API: Rejected because actor scope is listing/property extraction, not reviews.
+- Request without persisted extensions: Rejected (400 invalid_input).
+
+## HTTP-only viability
+
+- StaysSearch API works with direct HTTP requests through got-scraping.
+- No browser automation is required for extraction.
+- Runtime healing refreshes API key, reuses the canonical bootstrap URL as referer, and attempts operation hash refresh when needed.
+- Pagination cursors for broad city queries may still return heavy overlap between pages; source exhaustion before requested count is possible even when `results_wanted` is high.
+
+## Runtime Auto-Refresh
+- Runtime StaysSearch Operation ID: 753d97c7b19a1a402d2fa63882ff4d6802004d11f2499647deef923a19a1641a
+- Last Runtime Refresh UTC: 2026-04-22T11:04:36.976Z
