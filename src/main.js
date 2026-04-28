@@ -9,7 +9,7 @@ const DEFAULT_LOCALE = 'en';
 const DEFAULT_CURRENCY = 'USD';
 const DEFAULT_RESULTS_PER_PAGE_ESTIMATE = 18;
 const DEFAULT_CURSOR_VERSION = 1;
-const MAX_SYNTHETIC_CURSOR_PROBES = 8;
+const BASE_MAX_SYNTHETIC_CURSOR_PROBES = 8;
 const MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES = 10;
 
 const AIRBNB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
@@ -610,6 +610,20 @@ const buildCursorToken = ({ sectionOffset, itemsOffset, version = DEFAULT_CURSOR
     version,
 }));
 
+const getCursorKey = (cursor) => {
+    if (!cursor) return 'first-page';
+
+    const payload = decodeCursorPayload(cursor);
+    if (!payload) return `token:${cursor}`;
+
+    return `offset:${payload.sectionOffset}:${payload.itemsOffset}:${payload.version}`;
+};
+
+const getCursorOffset = (cursor) => {
+    const payload = decodeCursorPayload(cursor);
+    return Number.isFinite(payload?.itemsOffset) ? payload.itemsOffset : Number.MAX_SAFE_INTEGER;
+};
+
 const getItemsPerGrid = (baseVariables) => {
     const rawParams = asArray(baseVariables?.staysSearchRequest?.rawParams);
     const found = rawParams.find((entry) => entry?.filterName === 'itemsPerGrid' || entry?.filterName === 'items_per_grid');
@@ -617,24 +631,32 @@ const getItemsPerGrid = (baseVariables) => {
     return safePositiveInt(value, DEFAULT_RESULTS_PER_PAGE_ESTIMATE);
 };
 
-// Adds all discovered cursors into a queue while preserving API-returned order.
-// This avoids skipping valid cursors that may share the same items_offset.
-const collectCursors = (paginationInfo, queue, queuedCursors, visitedCursors) => {
-    const next = cleanString(paginationInfo?.nextPageCursor);
+// Adds discovered cursors into a queue, deduped by canonical offset key and ordered by offset.
+const collectCursors = (paginationInfo, queue, queuedCursorKeys, visitedCursorKeys, maxObservedItemsOffset) => {
     const pages = asArray(paginationInfo?.pageCursors).map((c) => cleanString(c)).filter(Boolean);
 
-    for (const c of [next, ...pages].filter(Boolean)) {
-        if (visitedCursors.has(c) || queuedCursors.has(c)) continue;
+    for (const c of pages) {
+        const key = getCursorKey(c);
+        if (visitedCursorKeys.has(key) || queuedCursorKeys.has(key)) continue;
+
+        const payload = decodeCursorPayload(c);
+        if (payload?.sectionOffset === 0 && Number.isFinite(payload?.itemsOffset) && payload.itemsOffset <= maxObservedItemsOffset) {
+            continue;
+        }
+
         queue.push(c);
-        queuedCursors.add(c);
+        queuedCursorKeys.add(key);
     }
+
+    queue.sort((a, b) => getCursorOffset(a) - getCursorOffset(b));
 };
 
-const takeNextCursor = (queue, queuedCursors, visitedCursors) => {
+const takeNextCursor = (queue, queuedCursorKeys, visitedCursorKeys) => {
     while (queue.length > 0) {
         const cursor = queue.shift();
-        queuedCursors.delete(cursor);
-        if (!visitedCursors.has(cursor)) return cursor;
+        const key = getCursorKey(cursor);
+        queuedCursorKeys.delete(key);
+        if (!visitedCursorKeys.has(key)) return cursor;
     }
 
     return undefined;
@@ -1004,13 +1026,23 @@ const fetchListings = async ({
 }) => {
     const rows = [];
     const seenListingKeys = new Set();
-    // visitedCursors: tokens we have already used to make a request.
-    const visitedCursors = new Set(['', buildCursorToken({ sectionOffset: 0, itemsOffset: 0 })]);
+    // visitedCursorKeys: canonical cursor keys we have already requested.
+    const visitedCursorKeys = new Set([
+        getCursorKey(undefined),
+        getCursorKey(buildCursorToken({ sectionOffset: 0, itemsOffset: 0 })),
+    ]);
     // Cursors that are discovered but not requested yet.
     const cursorQueue = [];
-    const queuedCursors = new Set();
+    const queuedCursorKeys = new Set();
     const syntheticOffsetsUsed = new Set();
     const itemsPerGrid = getItemsPerGrid(baseVariables);
+    // Keep synthetic probing budget adaptive to user intent (`max_pages`, `results_wanted`).
+    // A fixed low cap can end deep pagination too early on broad markets.
+    const maxSyntheticCursorProbes = Math.max(
+        BASE_MAX_SYNTHETIC_CURSOR_PROBES,
+        maxPages,
+        Math.ceil(targetCount / Math.max(1, itemsPerGrid)),
+    );
     let maxObservedItemsOffset = 0;
     let syntheticProbeCount = 0;
     let consecutiveNoNewPages = 0;
@@ -1019,7 +1051,7 @@ const fetchListings = async ({
 
     while (rows.length < targetCount && page <= maxPages) {
         // Mark current cursor used so we never re-request the same page.
-        visitedCursors.add(currentCursor ?? '');
+        visitedCursorKeys.add(getCursorKey(currentCursor));
 
         const variables = buildVariablesForPage(baseVariables, currentCursor);
 
@@ -1074,8 +1106,20 @@ const fetchListings = async ({
         const results = json?.data?.presentation?.staysSearch?.results;
         const items = asArray(results?.searchResults);
 
+        const currentCursorPayload = decodeCursorPayload(currentCursor);
+        if (Number.isFinite(currentCursorPayload?.itemsOffset)) {
+            maxObservedItemsOffset = Math.max(maxObservedItemsOffset, currentCursorPayload.itemsOffset);
+        }
+
         // Harvest cursor tokens before item handling so queue state is always current.
-        collectCursors(results?.paginationInfo, cursorQueue, queuedCursors, visitedCursors);
+        collectCursors(
+            results?.paginationInfo,
+            cursorQueue,
+            queuedCursorKeys,
+            visitedCursorKeys,
+            maxObservedItemsOffset,
+        );
+        const directNextCursor = cleanString(results?.paginationInfo?.nextPageCursor);
 
         const observedCursors = asArray(results?.paginationInfo?.pageCursors)
             .map((cursor) => decodeCursorPayload(cleanString(cursor)))
@@ -1110,7 +1154,14 @@ const fetchListings = async ({
             if (rows.length >= targetCount) break;
         }
 
-        const next = takeNextCursor(cursorQueue, queuedCursors, visitedCursors);
+        const directNextKey = getCursorKey(directNextCursor);
+        if (directNextCursor && !visitedCursorKeys.has(directNextKey) && !queuedCursorKeys.has(directNextKey)) {
+            currentCursor = directNextCursor;
+            page++;
+            continue;
+        }
+
+        const next = takeNextCursor(cursorQueue, queuedCursorKeys, visitedCursorKeys);
         if (next) {
             currentCursor = next;
             page++;
@@ -1118,12 +1169,20 @@ const fetchListings = async ({
         }
 
         const nextSyntheticOffset = maxObservedItemsOffset + itemsPerGrid;
+        const reachedSyntheticProbeLimit = syntheticProbeCount >= maxSyntheticCursorProbes;
+        const reachedNoNewLimit = consecutiveNoNewPages >= MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES;
         if (
             page >= maxPages
             || syntheticOffsetsUsed.has(nextSyntheticOffset)
-            || syntheticProbeCount >= MAX_SYNTHETIC_CURSOR_PROBES
-            || consecutiveNoNewPages >= MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES
+            || reachedSyntheticProbeLimit
+            || reachedNoNewLimit
         ) {
+            if (reachedSyntheticProbeLimit) {
+                log.info(`Stopped synthetic cursor probing at limit ${maxSyntheticCursorProbes}.`);
+            }
+            if (reachedNoNewLimit) {
+                log.info(`Stopped after ${MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES} consecutive pages with no new unique listings.`);
+            }
             log.info(`All available cursors exhausted after page ${page}. Source fully scraped.`);
             break;
         }
