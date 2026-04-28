@@ -1067,8 +1067,10 @@ const fetchListings = async ({
     seedUrl,
     baseVariables,
     sourceLabel = 'source',
+    onBatchSaved = async (rows) => rows.length,
 }) => {
     const rows = [];
+    let persistedCount = 0;
     const seenListingKeys = new Set();
     // visitedCursorKeys: canonical cursor keys we have already requested.
     const visitedCursorKeys = new Set([
@@ -1178,6 +1180,7 @@ const fetchListings = async ({
             consecutiveNoNewPages++;
         } else {
             const beforePageCount = rows.length;
+            const newRowsThisPage = [];
 
             for (const item of items) {
                 const mapped = mapListingItem({ item, rank: rows.length + 1, searchContext });
@@ -1188,20 +1191,24 @@ const fetchListings = async ({
                 if (dedupKey) seenListingKeys.add(dedupKey);
 
                 rows.push(mapped);
-                if (rows.length >= targetCount) break;
+                newRowsThisPage.push(mapped);
             }
 
             const newThisPage = rows.length - beforePageCount;
+            if (newRowsThisPage.length > 0) {
+                const accepted = Number(await onBatchSaved(newRowsThisPage)) || 0;
+                persistedCount += Math.max(0, accepted);
+            }
             consecutiveNoNewPages = newThisPage > 0 ? 0 : consecutiveNoNewPages + 1;
             const shouldLogProgress = page === 1
                 || page % PROGRESS_LOG_INTERVAL_PAGES === 0
-                || rows.length >= targetCount
+                || persistedCount >= targetCount
                 || (newThisPage === 0 && consecutiveNoNewPages % 3 === 0);
             if (shouldLogProgress) {
-                log.info(`[${sourceLabel}] page ${page}: +${newThisPage} new, ${rows.length} unique total.`);
+                log.info(`[${sourceLabel}] page ${page}: +${newThisPage} new, ${rows.length} unique source, ${persistedCount} pushed.`);
             }
 
-            if (rows.length >= targetCount) break;
+            if (persistedCount >= targetCount) break;
         }
 
         const directNextKey = getCursorKey(directNextCursor);
@@ -1245,11 +1252,35 @@ const fetchListings = async ({
         page++;
     }
 
-    if (rows.length < targetCount) {
-        log.info(`[${sourceLabel}] saved ${rows.length}/${targetCount} requested unique listings before exhaustion.`);
+    if (persistedCount < targetCount) {
+        log.info(`[${sourceLabel}] pushed ${persistedCount}/${targetCount} requested unique listings before exhaustion.`);
     }
 
-    return rows;
+    return {
+        sourceUniqueCount: rows.length,
+        persistedCount,
+    };
+};
+
+const createBatchSaver = ({ globalSeenListingKeys, resultsWanted, savedState }) => async (pageRows) => {
+    const counter = savedState;
+    if (!pageRows.length || counter.savedCount >= resultsWanted) return 0;
+
+    const accepted = [];
+    for (const listing of pageRows) {
+        if (counter.savedCount >= resultsWanted) break;
+        const key = buildDedupKey(listing);
+        if (key && globalSeenListingKeys.has(key)) continue;
+        if (key) globalSeenListingKeys.add(key);
+        accepted.push(listing);
+        counter.savedCount++;
+    }
+
+    if (accepted.length > 0) {
+        await Actor.pushData(accepted);
+    }
+
+    return accepted.length;
 };
 
 await Actor.main(async () => {
@@ -1300,15 +1331,15 @@ await Actor.main(async () => {
 
     await refreshApiDiscoveryFile({ staysSearchOperationId: apiContext.staysSearchOperationId });
 
-    const allListings = [];
+    const globalState = { savedCount: 0 };
     const globalSeenListingKeys = new Set();
 
     for (let i = 0; i < inputUrls.length; i++) {
-        if (allListings.length >= resultsWanted) break;
+        if (globalState.savedCount >= resultsWanted) break;
 
         const source = inputUrls[i];
         const sourceSeedUrl = buildSeedUrl({ url: source.runtimeUrl });
-        const remainingTarget = resultsWanted - allListings.length;
+        const remainingTarget = resultsWanted - globalState.savedCount;
         const sourceMaxPages = computeAutoMaxPages(remainingTarget);
         const sourceLabel = `source ${i + 1}/${inputUrls.length}`;
 
@@ -1333,7 +1364,13 @@ await Actor.main(async () => {
             rawParams: buildRawParamsFromInput({ url: source.runtimeUrl, adults }),
         });
 
-        const sourceListings = await fetchListings({
+        const onBatchSaved = createBatchSaver({
+            globalSeenListingKeys,
+            resultsWanted,
+            savedState: globalState,
+        });
+
+        const sourceResult = await fetchListings({
             targetCount: remainingTarget,
             maxPages: sourceMaxPages,
             locale: cleanString(locale) || DEFAULT_LOCALE,
@@ -1344,25 +1381,15 @@ await Actor.main(async () => {
             seedUrl: sourceSeedUrl,
             baseVariables,
             sourceLabel,
+            onBatchSaved,
         });
 
-        let sourceAdded = 0;
-        for (const listing of sourceListings) {
-            const key = buildDedupKey(listing);
-            if (key && globalSeenListingKeys.has(key)) continue;
-            if (key) globalSeenListingKeys.add(key);
-            allListings.push(listing);
-            sourceAdded++;
-            if (allListings.length >= resultsWanted) break;
-        }
-
-        log.info(`[${sourceLabel}] contributed ${sourceAdded} new listing(s), global total ${allListings.length}/${resultsWanted}.`);
+        log.info(`[${sourceLabel}] contributed ${sourceResult.persistedCount} listing(s), global total ${globalState.savedCount}/${resultsWanted}.`);
     }
 
-    if (!allListings.length) {
+    if (!globalState.savedCount) {
         throw new Error('No listings found. Try another Airbnb search URL or broader search filters.');
     }
 
-    await Actor.pushData(allListings);
-    log.info(`Saved ${allListings.length} listing(s).`);
+    log.info(`Saved ${globalState.savedCount} listing(s).`);
 });
