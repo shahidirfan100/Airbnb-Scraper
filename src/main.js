@@ -11,6 +11,9 @@ const DEFAULT_RESULTS_PER_PAGE_ESTIMATE = 18;
 const DEFAULT_CURSOR_VERSION = 1;
 const BASE_MAX_SYNTHETIC_CURSOR_PROBES = 8;
 const MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES = 10;
+const PROGRESS_LOG_INTERVAL_PAGES = 5;
+const AUTO_MAX_PAGES_MIN = 12;
+const AUTO_MAX_PAGES_MAX = 200;
 
 const AIRBNB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
 const AIRBNB_BASE_ORIGIN = 'https://www.airbnb.com';
@@ -246,6 +249,46 @@ const buildSearchUrlFromLooseText = (inputValue) => {
     if (!safe) return undefined;
 
     return `${AIRBNB_BASE_ORIGIN}/s/${encodeURIComponent(safe)}/homes`;
+};
+
+const normalizeInputUrls = ({ urls, url }) => {
+    const candidates = [];
+    const pushCandidate = (value) => {
+        if (value === null || value === undefined) return;
+        const str = cleanString(value);
+        if (str) candidates.push(str);
+    };
+
+    if (Array.isArray(urls)) {
+        for (const item of urls) pushCandidate(item);
+    } else {
+        pushCandidate(urls);
+    }
+
+    // Backward compatibility for older tasks that still send a single `url`.
+    pushCandidate(url);
+
+    const normalized = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+        const extracted = extractAirbnbUrlCandidate(candidate);
+        const resilient = extracted || buildSearchUrlFromLooseText(candidate) || AIRBNB_FALLBACK_SEARCH_URL;
+        if (!resilient || seen.has(resilient)) continue;
+        seen.add(resilient);
+        normalized.push({
+            inputValue: candidate,
+            runtimeUrl: resilient,
+            wasInferred: !extracted,
+        });
+    }
+
+    return normalized;
+};
+
+const computeAutoMaxPages = (targetCount) => {
+    const estimate = Math.ceil(Math.max(1, targetCount) / DEFAULT_RESULTS_PER_PAGE_ESTIMATE);
+    const buffered = (estimate * 4) + 10;
+    return Math.min(AUTO_MAX_PAGES_MAX, Math.max(AUTO_MAX_PAGES_MIN, buffered));
 };
 
 const extractNumericIdFromUrl = (urlString) => {
@@ -1023,6 +1066,7 @@ const fetchListings = async ({
     searchContext,
     seedUrl,
     baseVariables,
+    sourceLabel = 'source',
 }) => {
     const rows = [];
     const seenListingKeys = new Set();
@@ -1036,7 +1080,7 @@ const fetchListings = async ({
     const queuedCursorKeys = new Set();
     const syntheticOffsetsUsed = new Set();
     const itemsPerGrid = getItemsPerGrid(baseVariables);
-    // Keep synthetic probing budget adaptive to user intent (`max_pages`, `results_wanted`).
+    // Keep synthetic probing budget adaptive to user intent (`results_wanted`).
     // A fixed low cap can end deep pagination too early on broad markets.
     const maxSyntheticCursorProbes = Math.max(
         BASE_MAX_SYNTHETIC_CURSOR_PROBES,
@@ -1148,8 +1192,14 @@ const fetchListings = async ({
             }
 
             const newThisPage = rows.length - beforePageCount;
-            log.info(`Processed page ${page}: ${newThisPage} new listing(s), ${rows.length} total unique.`);
             consecutiveNoNewPages = newThisPage > 0 ? 0 : consecutiveNoNewPages + 1;
+            const shouldLogProgress = page === 1
+                || page % PROGRESS_LOG_INTERVAL_PAGES === 0
+                || rows.length >= targetCount
+                || (newThisPage === 0 && consecutiveNoNewPages % 3 === 0);
+            if (shouldLogProgress) {
+                log.info(`[${sourceLabel}] page ${page}: +${newThisPage} new, ${rows.length} unique total.`);
+            }
 
             if (rows.length >= targetCount) break;
         }
@@ -1178,12 +1228,12 @@ const fetchListings = async ({
             || reachedNoNewLimit
         ) {
             if (reachedSyntheticProbeLimit) {
-                log.info(`Stopped synthetic cursor probing at limit ${maxSyntheticCursorProbes}.`);
+                log.info(`[${sourceLabel}] stopped synthetic probing at limit ${maxSyntheticCursorProbes}.`);
             }
             if (reachedNoNewLimit) {
-                log.info(`Stopped after ${MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES} consecutive pages with no new unique listings.`);
+                log.info(`[${sourceLabel}] stopped after ${MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES} consecutive no-new pages.`);
             }
-            log.info(`All available cursors exhausted after page ${page}. Source fully scraped.`);
+            log.info(`[${sourceLabel}] source exhausted after page ${page}.`);
             break;
         }
 
@@ -1191,12 +1241,12 @@ const fetchListings = async ({
         syntheticProbeCount++;
         maxObservedItemsOffset = nextSyntheticOffset;
         currentCursor = buildCursorToken({ sectionOffset: 0, itemsOffset: nextSyntheticOffset });
-        log.info(`Cursor pool exhausted; probing additional offset ${nextSyntheticOffset}.`);
+        log.debug(`[${sourceLabel}] cursor pool exhausted; probing offset ${nextSyntheticOffset}.`);
         page++;
     }
 
     if (rows.length < targetCount) {
-        log.info(`Source exhausted before target count. Saved ${rows.length} unique listing(s) out of requested ${targetCount}.`);
+        log.info(`[${sourceLabel}] saved ${rows.length}/${targetCount} requested unique listings before exhaustion.`);
     }
 
     return rows;
@@ -1211,43 +1261,35 @@ await Actor.main(async () => {
     };
 
     const {
+        urls,
         url,
         adults = 1,
         results_wanted: resultsWantedInput = 20,
-        max_pages: maxPagesInput = 5,
         locale = DEFAULT_LOCALE,
         currency = DEFAULT_CURRENCY,
         proxyConfiguration,
     } = input;
 
-    const rawInputUrl = cleanString(url);
-    if (!rawInputUrl) {
-        throw new Error('Provide a valid Airbnb search url, or set one in INPUT.json for fallback runs.');
+    const inputUrls = normalizeInputUrls({ urls, url });
+    if (!inputUrls.length) {
+        throw new Error('Provide at least one valid Airbnb search URL in `urls`.');
     }
-    const normalizedInputUrl = extractAirbnbUrlCandidate(rawInputUrl);
-    const runtimeUrl = normalizedInputUrl || buildSeedUrl({ url: rawInputUrl });
-    if (!normalizedInputUrl) {
-        log.warning(`Input URL looked malformed; inferred a resilient search URL: ${runtimeUrl}`);
+
+    for (const source of inputUrls) {
+        if (source.wasInferred) {
+            log.warning(`Input URL looked malformed; inferred resilient URL: ${source.runtimeUrl}`);
+        }
     }
 
     const proxyConfig = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : undefined;
 
     const resultsWanted = safePositiveInt(resultsWantedInput, 20);
-    const userProvidedMaxPages = Object.hasOwn(input, 'max_pages');  // check merged input, not just actorInput
-    const configuredMaxPages = safePositiveInt(maxPagesInput, 5);
-    // Allow enough pages: each real Airbnb page holds ~18 listings, but the API may return
-    // duplicate pages between real ones, so we triple the estimate to account for skipped pages.
-    const maxPages = userProvidedMaxPages
-        ? configuredMaxPages
-        : Math.max(configuredMaxPages, Math.ceil((resultsWanted / DEFAULT_RESULTS_PER_PAGE_ESTIMATE) * 3) + 5);
+    log.info(`Starting scrape: resultsWanted=${resultsWanted}, sources=${inputUrls.length}.`);
 
-    log.info(`Starting scrape: resultsWanted=${resultsWanted}, maxPages=${maxPages}, url=${runtimeUrl}`);
-
-    const seedUrl = buildSeedUrl({ url: runtimeUrl });
-    const searchContext = runtimeUrl || seedUrl || rawInputUrl;
+    const firstSourceSeed = buildSeedUrl({ url: inputUrls[0].runtimeUrl });
 
     const apiContext = await refreshAirbnbApiContext({
-        seedUrl,
+        seedUrl: firstSourceSeed,
         proxyConfiguration: proxyConfig,
         existingContext: {
             staysSearchOperationId: DEFAULT_STAYS_SEARCH_OPERATION_ID,
@@ -1258,30 +1300,69 @@ await Actor.main(async () => {
 
     await refreshApiDiscoveryFile({ staysSearchOperationId: apiContext.staysSearchOperationId });
 
-    const deferredVariables = apiContext.deferredVariables && typeof apiContext.deferredVariables === 'object'
-        ? apiContext.deferredVariables
-        : undefined;
+    const allListings = [];
+    const globalSeenListingKeys = new Set();
 
-    const baseVariables = deferredVariables || buildSearchVariables({
-        rawParams: buildRawParamsFromInput({ url: runtimeUrl, adults }),
-    });
+    for (let i = 0; i < inputUrls.length; i++) {
+        if (allListings.length >= resultsWanted) break;
 
-    const listings = await fetchListings({
-        targetCount: resultsWanted,
-        maxPages,
-        locale: cleanString(locale) || DEFAULT_LOCALE,
-        currency: cleanString(currency) || DEFAULT_CURRENCY,
-        apiContext,
-        proxyConfiguration: proxyConfig,
-        searchContext,
-        seedUrl,
-        baseVariables,
-    });
+        const source = inputUrls[i];
+        const sourceSeedUrl = buildSeedUrl({ url: source.runtimeUrl });
+        const remainingTarget = resultsWanted - allListings.length;
+        const sourceMaxPages = computeAutoMaxPages(remainingTarget);
+        const sourceLabel = `source ${i + 1}/${inputUrls.length}`;
 
-    if (!listings.length) {
+        log.info(`[${sourceLabel}] target=${remainingTarget}, autoMaxPages=${sourceMaxPages}`);
+
+        // Refresh source bootstrap/deferred variables while retaining healed API context.
+        const sourceContext = await refreshAirbnbApiContext({
+            seedUrl: sourceSeedUrl,
+            proxyConfiguration: proxyConfig,
+            existingContext: apiContext,
+            refreshHash: false,
+            refreshKey: false,
+            refreshHeaders: false,
+        });
+
+        Object.assign(apiContext, sourceContext);
+
+        const sourceDeferredVariables = sourceContext.deferredVariables && typeof sourceContext.deferredVariables === 'object'
+            ? sourceContext.deferredVariables
+            : undefined;
+        const baseVariables = sourceDeferredVariables || buildSearchVariables({
+            rawParams: buildRawParamsFromInput({ url: source.runtimeUrl, adults }),
+        });
+
+        const sourceListings = await fetchListings({
+            targetCount: remainingTarget,
+            maxPages: sourceMaxPages,
+            locale: cleanString(locale) || DEFAULT_LOCALE,
+            currency: cleanString(currency) || DEFAULT_CURRENCY,
+            apiContext,
+            proxyConfiguration: proxyConfig,
+            searchContext: source.runtimeUrl || sourceSeedUrl || source.inputValue,
+            seedUrl: sourceSeedUrl,
+            baseVariables,
+            sourceLabel,
+        });
+
+        let sourceAdded = 0;
+        for (const listing of sourceListings) {
+            const key = buildDedupKey(listing);
+            if (key && globalSeenListingKeys.has(key)) continue;
+            if (key) globalSeenListingKeys.add(key);
+            allListings.push(listing);
+            sourceAdded++;
+            if (allListings.length >= resultsWanted) break;
+        }
+
+        log.info(`[${sourceLabel}] contributed ${sourceAdded} new listing(s), global total ${allListings.length}/${resultsWanted}.`);
+    }
+
+    if (!allListings.length) {
         throw new Error('No listings found. Try another Airbnb search URL or broader search filters.');
     }
 
-    await Actor.pushData(listings);
-    log.info(`Saved ${listings.length} listing(s).`);
+    await Actor.pushData(allListings);
+    log.info(`Saved ${allListings.length} listing(s).`);
 });

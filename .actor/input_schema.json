@@ -4,12 +4,17 @@
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "url": {
-      "title": "Airbnb Search URL",
-      "type": "string",
-      "description": "Preferred input. Any Airbnb search URL from /s/.../homes is supported.",
-      "editor": "textfield",
-      "prefill": "https://www.airbnb.com/s/London--United-Kingdom/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1"
+    "urls": {
+      "title": "Airbnb Search URLs",
+      "type": "array",
+      "description": "One or more Airbnb /s/.../homes URLs. The actor will iterate all URLs until results_wanted is reached or sources are exhausted.",
+      "editor": "stringList",
+      "prefill": [
+        "https://www.airbnb.com/s/London--United-Kingdom/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1"
+      ],
+      "items": {
+        "type": "string"
+      }
     },
     "results_wanted": {
       "title": "Results wanted",
@@ -18,15 +23,6 @@
       "minimum": 1,
       "default": 20,
       "prefill": 20,
-      "editor": "number"
-    },
-    "max_pages": {
-      "title": "Maximum pages",
-      "type": "integer",
-      "description": "Safety cap for API pagination loops.",
-      "minimum": 1,
-      "default": 5,
-      "prefill": 5,
       "editor": "number"
     },
     "proxyConfiguration": {
