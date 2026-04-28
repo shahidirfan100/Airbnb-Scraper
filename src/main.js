@@ -13,6 +13,26 @@ const MAX_SYNTHETIC_CURSOR_PROBES = 8;
 const MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES = 10;
 
 const AIRBNB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
+const AIRBNB_BASE_ORIGIN = 'https://www.airbnb.com';
+const AIRBNB_FALLBACK_SEARCH_URL = `${AIRBNB_BASE_ORIGIN}/s/London--United-Kingdom/homes`;
+const MAX_URL_EXTRACTION_DEPTH = 3;
+const URL_WRAPPER_PARAM_KEYS = ['url', 'u', 'q', 'target', 'dest', 'destination', 'redirect', 'next', 'continue'];
+const HEALABLE_HEADER_DEFAULTS = {
+    'x-airbnb-graphql-platform': 'web',
+    'x-airbnb-graphql-platform-client': 'minimalist-niobe',
+    'x-csrf-without-token': '1',
+    'x-airbnb-supports-airlock-v2': 'true',
+    'x-niobe-short-circuited': 'true',
+    origin: AIRBNB_BASE_ORIGIN,
+};
+const HEADER_DISCOVERY_KEYS = [
+    'x-airbnb-graphql-platform',
+    'x-airbnb-graphql-platform-client',
+    'x-csrf-without-token',
+    'x-airbnb-supports-airlock-v2',
+    'x-niobe-short-circuited',
+    'x-client-version',
+];
 
 const RAW_PARAM_ALIASES = {
     section_offset: 'sectionOffset',
@@ -115,18 +135,117 @@ const encodeBase64 = (value) => Buffer.from(String(value), 'utf8').toString('bas
 
 const stripTrailingNoise = (value) => value.replace(/[)\],.]+$/g, '');
 
-const extractAirbnbUrlCandidate = (inputValue) => {
+const decodeHtmlEntitiesLite = (value) => value
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#x27;/gi, '\'')
+    .replace(/&#39;/gi, '\'')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+
+const normalizeHeaderName = (value) => cleanString(value)?.toLowerCase();
+
+const normalizeAirbnbUrlCandidate = (candidate) => {
+    const cleaned = cleanString(candidate);
+    if (!cleaned) return undefined;
+
+    const withoutTrail = stripTrailingNoise(cleaned)
+        .replace(/\\\//g, '/')
+        .replace(/^["'`([]+/, '')
+        .replace(/["'`)\]]+$/, '');
+    let withProtocol;
+    if (/^(?:https?:)?\/\//i.test(withoutTrail)) {
+        withProtocol = withoutTrail;
+    } else if (/^(?:www\.|m\.)?airbnb\./i.test(withoutTrail)) {
+        withProtocol = `https://${withoutTrail}`;
+    }
+    const finalCandidate = withProtocol || (/^\/s\//i.test(withoutTrail) ? `${AIRBNB_BASE_ORIGIN}${withoutTrail}` : undefined);
+    if (!finalCandidate) return undefined;
+
+    try {
+        const parsed = new URL(finalCandidate.startsWith('//') ? `https:${finalCandidate}` : finalCandidate);
+        if (!/(\.|^)airbnb\./i.test(parsed.hostname)) return undefined;
+        parsed.protocol = 'https:';
+        parsed.hash = '';
+        return parsed.toString();
+    } catch {
+        return undefined;
+    }
+};
+
+const collectNestedUrlCandidates = (raw) => {
+    const out = [];
+    const seen = new Set();
+    const queue = [cleanString(raw)];
+
+    while (queue.length) {
+        const value = cleanString(queue.shift());
+        if (!value || seen.has(value)) continue;
+        seen.add(value);
+        out.push(value);
+
+        const decoded = decodeRepeatedURIComponent(value);
+        if (decoded && !seen.has(decoded)) queue.push(decoded);
+
+        const htmlDecoded = decodeHtmlEntitiesLite(value);
+        if (htmlDecoded && !seen.has(htmlDecoded)) queue.push(htmlDecoded);
+
+        try {
+            const possibleUrl = /^(?:https?:)?\/\//i.test(value) ? value : undefined;
+            const parsed = possibleUrl ? new URL(possibleUrl.startsWith('//') ? `https:${possibleUrl}` : possibleUrl) : undefined;
+            if (!parsed) continue;
+            for (const key of URL_WRAPPER_PARAM_KEYS) {
+                const paramValue = cleanString(parsed.searchParams.get(key));
+                if (paramValue && !seen.has(paramValue)) queue.push(paramValue);
+            }
+        } catch {
+            continue;
+        }
+    }
+
+    return out;
+};
+
+const extractAirbnbUrlCandidate = (inputValue, depth = 0) => {
+    const raw = cleanString(inputValue);
+    if (!raw || depth > MAX_URL_EXTRACTION_DEPTH) return undefined;
+
+    const candidates = collectNestedUrlCandidates(raw);
+    for (const candidate of candidates) {
+        const direct = candidate.match(/https?:\/\/(?:www\.|m\.)?airbnb\.[^\s"'<>]+/i)
+            || candidate.match(/(?:www\.|m\.)?airbnb\.[^\s"'<>]+/i);
+        if (direct?.[0]) {
+            const normalized = normalizeAirbnbUrlCandidate(direct[0]);
+            if (normalized) return normalized;
+        }
+
+        const normalizedWhole = normalizeAirbnbUrlCandidate(candidate);
+        if (normalizedWhole) return normalizedWhole;
+    }
+
+    return undefined;
+};
+
+const buildSearchUrlFromLooseText = (inputValue) => {
     const raw = cleanString(inputValue);
     if (!raw) return undefined;
 
-    const direct = raw.match(/https?:\/\/(?:www\.)?airbnb\.[^\s"'<>]+/i);
-    if (direct?.[0]) return stripTrailingNoise(direct[0]);
+    const normalized = decodeHtmlEntitiesLite(decodeRepeatedURIComponent(raw))
+        .replace(/https?:\/\/\S+/gi, ' ')
+        .replace(/\bairbnb\b/gi, ' ')
+        .replace(/[^\p{L}\p{N}\s,.-]+/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!normalized || normalized.length < 3) return undefined;
 
-    const decoded = decodeRepeatedURIComponent(raw);
-    const nested = decoded.match(/https?:\/\/(?:www\.)?airbnb\.[^\s"'<>]+/i);
-    if (nested?.[0]) return stripTrailingNoise(nested[0]);
+    const safe = normalized
+        .replace(/\s*,\s*/g, '--')
+        .replace(/[.\s]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-+|-+$/g, '');
+    if (!safe) return undefined;
 
-    return undefined;
+    return `${AIRBNB_BASE_ORIGIN}/s/${encodeURIComponent(safe)}/homes`;
 };
 
 const extractNumericIdFromUrl = (urlString) => {
@@ -287,11 +406,67 @@ const discoverOperationIdFromBootstrap = async ({ operationName, bootstrapHtml, 
     return undefined;
 };
 
+const extractHeaderHintsFromHtml = (html, bootstrapUrl) => {
+    const hints = {};
+    const body = cleanString(html) || '';
+
+    for (const headerName of HEADER_DISCOVERY_KEYS) {
+        const escaped = escapeRegExp(headerName);
+        const pattern = new RegExp(`["']${escaped}["']\\s*[:=]\\s*["']([^"']+)["']`, 'i');
+        const match = body.match(pattern);
+        const value = cleanString(match?.[1]);
+        if (value) hints[headerName] = value;
+    }
+
+    const clientVersion = cleanString(body.match(/["']clientVersion["']\s*[:=]\s*["']([a-f0-9]{20,})["']/i)?.[1]);
+    if (clientVersion && !hints['x-client-version']) {
+        hints['x-client-version'] = clientVersion;
+    }
+
+    const referer = extractAirbnbUrlCandidate(bootstrapUrl);
+    if (referer) {
+        hints.referer = referer;
+    }
+
+    try {
+        const origin = referer ? new URL(referer).origin : AIRBNB_BASE_ORIGIN;
+        hints.origin = origin;
+    } catch {
+        hints.origin = AIRBNB_BASE_ORIGIN;
+    }
+
+    return hints;
+};
+
+const buildHeaderFallbacksForMissing = ({ missingHeaders = [], referer }) => {
+    const out = {};
+    const origin = (() => {
+        try {
+            return referer ? new URL(referer).origin : AIRBNB_BASE_ORIGIN;
+        } catch {
+            return AIRBNB_BASE_ORIGIN;
+        }
+    })();
+
+    for (const headerName of missingHeaders) {
+        const normalized = normalizeHeaderName(headerName);
+        if (!normalized) continue;
+        if (normalized === 'referer') out[normalized] = referer || AIRBNB_FALLBACK_SEARCH_URL;
+        else if (normalized === 'origin') out[normalized] = origin;
+        else if (HEALABLE_HEADER_DEFAULTS[normalized]) out[normalized] = HEALABLE_HEADER_DEFAULTS[normalized];
+    }
+
+    return out;
+};
+
 const buildSeedUrl = ({ url }) => {
     const explicitUrl = extractAirbnbUrlCandidate(url);
     if (explicitUrl) return explicitUrl;
 
-    return undefined;
+    const inferred = buildSearchUrlFromLooseText(url);
+    if (inferred) return inferred;
+
+    return AIRBNB_FALLBACK_SEARCH_URL;
 };
 
 const buildRawParamsFromInput = ({ url, adults }) => {
@@ -299,6 +474,13 @@ const buildRawParamsFromInput = ({ url, adults }) => {
     if (!explicitUrl) return [];
 
     const parsed = new URL(explicitUrl);
+    parsed.searchParams.delete('source_impression_id');
+    parsed.searchParams.delete('source');
+    parsed.searchParams.delete('tracking_id');
+    parsed.searchParams.delete('guests');
+    parsed.searchParams.delete('children');
+    parsed.searchParams.delete('infants');
+    parsed.searchParams.delete('pets');
     const grouped = new Map();
 
     parsed.searchParams.forEach((value, key) => {
@@ -387,25 +569,16 @@ const setRawParamValue = (rawParamsInput, name, value) => {
 
 const applyCursorToVariables = (variables, cursor) => {
     if (!cursor) return;
-    const decoded = decodeBase64(cursor);
-    if (!decoded) return;
-
-    let parsed;
-    try {
-        parsed = JSON.parse(decoded);
-    } catch {
-        return;
-    }
-
-    const sectionOffset = parsed?.section_offset;
-    const itemsOffset = parsed?.items_offset;
 
     for (const requestObject of [variables?.staysSearchRequest, variables?.staysMapSearchRequestV2]) {
         if (!requestObject || typeof requestObject !== 'object') continue;
+        // Airbnb StaysSearch expects token pagination through `cursor`,
+        // not raw numeric offset params. Offsets cause page loops/duplication.
         const withoutLegacySection = setRawParamValue(requestObject.rawParams, 'section_offset', undefined);
         const withoutLegacyItems = setRawParamValue(withoutLegacySection, 'items_offset', undefined);
-        const withSection = setRawParamValue(withoutLegacyItems, 'sectionOffset', sectionOffset);
-        requestObject.rawParams = setRawParamValue(withSection, 'itemsOffset', itemsOffset);
+        const withoutCamelSection = setRawParamValue(withoutLegacyItems, 'sectionOffset', undefined);
+        const withoutCamelItems = setRawParamValue(withoutCamelSection, 'itemsOffset', undefined);
+        requestObject.rawParams = setRawParamValue(withoutCamelItems, 'cursor', cursor);
     }
 };
 
@@ -487,29 +660,57 @@ const buildSearchUrl = ({ locale, currency, variables, operationId }) => (
     + `&extensions=${encodeURIComponent(JSON.stringify(buildExtensions(operationId)))}`
 );
 
-const requestJson = async ({ url, apiKey, proxyConfiguration, referer }) => {
-    const response = await gotScraping.get(url, {
-        proxyUrl: await maybeProxyUrl(proxyConfiguration),
-        headers: {
-            'user-agent': AIRBNB_USER_AGENT,
-            'x-airbnb-api-key': apiKey,
-            accept: 'application/json',
-            'accept-language': 'en-US,en;q=0.9',
-            referer,
-        },
-        timeout: { request: 45000 },
-        retry: { limit: 2 },
-        throwHttpErrors: false,
-    });
+const mergeHeaders = (...maps) => {
+    const out = {};
+    for (const map of maps) {
+        if (!map || typeof map !== 'object') continue;
+        for (const [name, value] of Object.entries(map)) {
+            const normalizedName = normalizeHeaderName(name);
+            const normalizedValue = cleanString(value);
+            if (!normalizedName || !normalizedValue) continue;
+            out[normalizedName] = normalizedValue;
+        }
+    }
+    return out;
+};
 
+const buildRequestHeaderProfiles = ({ apiKey, referer, headerHints }) => {
+    const base = {
+        'user-agent': AIRBNB_USER_AGENT,
+        'x-airbnb-api-key': apiKey,
+        accept: 'application/json',
+        'accept-language': 'en-US,en;q=0.9',
+        referer,
+    };
+
+    const softBrowserHeaders = {
+        origin: (() => {
+            try {
+                return referer ? new URL(referer).origin : AIRBNB_BASE_ORIGIN;
+            } catch {
+                return AIRBNB_BASE_ORIGIN;
+            }
+        })(),
+        'content-type': 'application/json',
+        'x-csrf-without-token': '1',
+    };
+
+    return [
+        mergeHeaders(base, headerHints),
+        mergeHeaders(base, HEALABLE_HEADER_DEFAULTS, headerHints),
+        mergeHeaders(base, HEALABLE_HEADER_DEFAULTS, headerHints, softBrowserHeaders),
+    ];
+};
+
+const parseResponseError = ({ response, fallbackMessage }) => {
     let json;
     try {
         json = JSON.parse(response.body);
     } catch {
-        const error = new Error(`Invalid JSON from Airbnb API (HTTP ${response.statusCode}).`);
+        const error = new Error(`${fallbackMessage} (HTTP ${response.statusCode}).`);
         error.statusCode = response.statusCode;
         error.responseBody = response.body;
-        throw error;
+        return error;
     }
 
     if (response.statusCode >= 400) {
@@ -517,7 +718,7 @@ const requestJson = async ({ url, apiKey, proxyConfiguration, referer }) => {
         error.statusCode = response.statusCode;
         error.responseBody = response.body;
         error.payload = json;
-        throw error;
+        return error;
     }
 
     if (Array.isArray(json?.errors) && json.errors.length) {
@@ -525,10 +726,40 @@ const requestJson = async ({ url, apiKey, proxyConfiguration, referer }) => {
         error.statusCode = response.statusCode;
         error.responseBody = response.body;
         error.payload = json;
-        throw error;
+        return error;
     }
 
-    return json;
+    return { json };
+};
+
+const requestJson = async ({ url, apiKey, proxyConfiguration, referer, headerHints = {} }) => {
+    const profiles = buildRequestHeaderProfiles({ apiKey, referer, headerHints });
+    const attempted = new Set();
+    let lastError;
+
+    for (const headers of profiles) {
+        const signature = JSON.stringify(headers);
+        if (attempted.has(signature)) continue;
+        attempted.add(signature);
+
+        const response = await gotScraping.get(url, {
+            proxyUrl: await maybeProxyUrl(proxyConfiguration),
+            headers,
+            timeout: { request: 45000 },
+            retry: { limit: 2 },
+            throwHttpErrors: false,
+        });
+
+        const parsed = parseResponseError({
+            response,
+            fallbackMessage: 'Invalid JSON from Airbnb API',
+        });
+
+        if (parsed?.json) return parsed.json;
+        lastError = parsed;
+    }
+
+    throw lastError || new Error('Airbnb API request failed for all header profiles.');
 };
 
 const normalizeErrorText = (error) => {
@@ -536,6 +767,19 @@ const normalizeErrorText = (error) => {
     const body = cleanString(error?.responseBody) || '';
     const message = cleanString(error?.message) || '';
     return `${message} ${body} ${payload}`.toLowerCase();
+};
+
+const extractMissingHeaderNames = (error) => {
+    const text = normalizeErrorText(error);
+    const names = new Set();
+    const missingPattern = /(?:missing|required|invalid)[\w\s:-]{0,60}?(x-[a-z0-9-]+|referer|origin|content-type)/gi;
+
+    for (const match of text.matchAll(missingPattern)) {
+        const headerName = normalizeHeaderName(match?.[1]);
+        if (headerName) names.add(headerName);
+    }
+
+    return Array.from(names);
 };
 
 const isPersistedQueryIssue = (error) => {
@@ -549,12 +793,22 @@ const isApiKeyIssue = (error) => {
     return text.includes('api key') || text.includes('x-airbnb-api-key') || text.includes('unauthorized');
 };
 
+const isHeaderIssue = (error) => {
+    const text = normalizeErrorText(error);
+    if (extractMissingHeaderNames(error).length > 0) return true;
+    return text.includes('header')
+        || text.includes('csrf')
+        || text.includes('forbidden')
+        || text.includes('bad request')
+        || text.includes('invalid_request');
+};
+
 const getBootstrapData = async ({ seedUrl, proxyConfiguration }) => {
     const candidates = Array.from(new Set([
         cleanString(seedUrl),
         extractAirbnbUrlCandidate(seedUrl),
-        'https://www.airbnb.com/s/London--United-Kingdom/homes',
-        'https://www.airbnb.com/',
+        AIRBNB_FALLBACK_SEARCH_URL,
+        `${AIRBNB_BASE_ORIGIN}/`,
     ].filter(Boolean)));
 
     let firstSuccessful;
@@ -565,8 +819,13 @@ const getBootstrapData = async ({ seedUrl, proxyConfiguration }) => {
             const html = response.body;
             const apiKey = extractApiKeyFromHtml(html);
             const deferredVariables = extractDeferredVariables(html);
-            if (!firstSuccessful) firstSuccessful = { html, url, apiKey, deferredVariables };
-            if (apiKey) return { html, url, apiKey, deferredVariables };
+            const headerHints = extractHeaderHintsFromHtml(html, url);
+            if (!firstSuccessful) firstSuccessful = {
+                html, url, apiKey, deferredVariables, headerHints,
+            };
+            if (apiKey) return {
+                html, url, apiKey, deferredVariables, headerHints,
+            };
         } catch (error) {
             log.warning(`Could not read bootstrap data from ${url}: ${error.message}`);
         }
@@ -582,12 +841,15 @@ const refreshAirbnbApiContext = async ({
     existingContext = {},
     refreshHash = true,
     refreshKey = true,
+    refreshHeaders = true,
+    requiredHeaderNames = [],
 }) => {
     const context = {
         staysSearchOperationId: cleanString(existingContext.staysSearchOperationId),
         apiKey: cleanString(existingContext.apiKey),
         bootstrapUrl: cleanString(existingContext.bootstrapUrl),
         deferredVariables: existingContext.deferredVariables,
+        headerHints: mergeHeaders(existingContext.headerHints),
     };
 
     const bootstrap = await getBootstrapData({ seedUrl, proxyConfiguration });
@@ -606,6 +868,19 @@ const refreshAirbnbApiContext = async ({
             proxyConfiguration,
         });
         context.staysSearchOperationId = discoveredHash || context.staysSearchOperationId;
+    }
+
+    if (refreshHeaders || !Object.keys(context.headerHints).length) {
+        const fallbackHints = buildHeaderFallbacksForMissing({
+            missingHeaders: requiredHeaderNames,
+            referer: bootstrap.url || seedUrl,
+        });
+        context.headerHints = mergeHeaders(
+            HEALABLE_HEADER_DEFAULTS,
+            context.headerHints,
+            bootstrap.headerHints,
+            fallbackHints,
+        );
     }
 
     context.staysSearchOperationId = context.staysSearchOperationId || DEFAULT_STAYS_SEARCH_OPERATION_ID;
@@ -730,7 +1005,7 @@ const fetchListings = async ({
     const rows = [];
     const seenListingKeys = new Set();
     // visitedCursors: tokens we have already used to make a request.
-    const visitedCursors = new Set();
+    const visitedCursors = new Set(['', buildCursorToken({ sectionOffset: 0, itemsOffset: 0 })]);
     // Cursors that are discovered but not requested yet.
     const cursorQueue = [];
     const queuedCursors = new Set();
@@ -758,31 +1033,40 @@ const fetchListings = async ({
             apiKey: apiContext.apiKey,
             proxyConfiguration,
             referer: apiContext.bootstrapUrl || seedUrl,
+            headerHints: apiContext.headerHints,
         });
 
         let json;
         try {
             json = await runRequest();
         } catch (error) {
+            const missingHeaders = extractMissingHeaderNames(error);
             const refreshHash = isPersistedQueryIssue(error);
             const refreshKey = isApiKeyIssue(error) || !apiContext.apiKey;
-            if (!refreshHash && !refreshKey) throw error;
+            const refreshHeaders = isHeaderIssue(error);
+            if (!refreshHash && !refreshKey && !refreshHeaders) throw error;
 
             const previousHash = apiContext.staysSearchOperationId;
             const previousKey = apiContext.apiKey;
+            const previousHeaders = JSON.stringify(apiContext.headerHints || {});
             const refreshed = await refreshAirbnbApiContext({
                 seedUrl,
                 proxyConfiguration,
                 existingContext: apiContext,
                 refreshHash,
                 refreshKey,
+                refreshHeaders,
+                requiredHeaderNames: missingHeaders,
             });
 
             Object.assign(apiContext, refreshed);
-            const contextChanged = previousHash !== apiContext.staysSearchOperationId || previousKey !== apiContext.apiKey;
+            const nextHeaders = JSON.stringify(apiContext.headerHints || {});
+            const contextChanged = previousHash !== apiContext.staysSearchOperationId
+                || previousKey !== apiContext.apiKey
+                || previousHeaders !== nextHeaders;
             if (!contextChanged) throw error;
 
-            log.warning(`Auto-healed Airbnb API context (hash refreshed: ${refreshHash}, key refreshed: ${refreshKey}).`);
+            log.warning(`Auto-healed Airbnb API context (hash: ${refreshHash}, key: ${refreshKey}, headers: ${refreshHeaders}).`);
             await refreshApiDiscoveryFile({ staysSearchOperationId: apiContext.staysSearchOperationId });
             json = await runRequest();
         }
@@ -877,9 +1161,14 @@ await Actor.main(async () => {
         proxyConfiguration,
     } = input;
 
-    const runtimeUrl = cleanString(url);
-    if (!runtimeUrl) {
+    const rawInputUrl = cleanString(url);
+    if (!rawInputUrl) {
         throw new Error('Provide a valid Airbnb search url, or set one in INPUT.json for fallback runs.');
+    }
+    const normalizedInputUrl = extractAirbnbUrlCandidate(rawInputUrl);
+    const runtimeUrl = normalizedInputUrl || buildSeedUrl({ url: rawInputUrl });
+    if (!normalizedInputUrl) {
+        log.warning(`Input URL looked malformed; inferred a resilient search URL: ${runtimeUrl}`);
     }
 
     const proxyConfig = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : undefined;
@@ -896,7 +1185,7 @@ await Actor.main(async () => {
     log.info(`Starting scrape: resultsWanted=${resultsWanted}, maxPages=${maxPages}, url=${runtimeUrl}`);
 
     const seedUrl = buildSeedUrl({ url: runtimeUrl });
-    const searchContext = runtimeUrl || seedUrl;
+    const searchContext = runtimeUrl || seedUrl || rawInputUrl;
 
     const apiContext = await refreshAirbnbApiContext({
         seedUrl,

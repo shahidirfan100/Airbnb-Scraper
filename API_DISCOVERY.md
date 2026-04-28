@@ -9,8 +9,8 @@
 - Operation ID: 753d97c7b19a1a402d2fa63882ff4d6802004d11f2499647deef923a19a1641a
 - Pagination:
   - results.paginationInfo.nextPageCursor
-  - cursor decodes to section_offset and items_offset
-  - request rawParams must use camelCase keys: sectionOffset and itemsOffset
+  - pass the token as rawParams `cursor` on subsequent requests
+  - decoding cursor to offsets and sending `sectionOffset/itemsOffset` can cause page-loop duplication
 - Field count: 25+ listing/property fields per result item
 
 ### Fields available (non-exhaustive)
@@ -43,4 +43,4 @@
 
 ## Runtime Auto-Refresh
 - Runtime StaysSearch Operation ID: 753d97c7b19a1a402d2fa63882ff4d6802004d11f2499647deef923a19a1641a
-- Last Runtime Refresh UTC: 2026-04-22T11:04:36.976Z
+- Last Runtime Refresh UTC: 2026-04-28T06:13:55.664Z
