@@ -14,8 +14,16 @@ const MAX_CONSECUTIVE_EMPTY_UNIQUE_PAGES = 10;
 const PROGRESS_LOG_INTERVAL_PAGES = 5;
 const AUTO_MAX_PAGES_MIN = 12;
 const AUTO_MAX_PAGES_MAX = 200;
+const API_REQUEST_MAX_ATTEMPTS = 4;
+const API_REQUEST_RETRY_BASE_MS = 2000;
+const API_REQUEST_MIN_DELAY_MS = 1400;
+const API_REQUEST_MAX_DELAY_MS = 3200;
+const API_RATE_LIMIT_MIN_DELAY_MS = 12000;
+const API_RATE_LIMIT_MAX_DELAY_MS = 45000;
 
-const AIRBNB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
+const AIRBNB_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
+const AIRBNB_DESKTOP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
+const AIRBNB_ANDROID_APP_USER_AGENT = 'okhttp/4.12.0';
 const AIRBNB_BASE_ORIGIN = 'https://www.airbnb.com';
 const AIRBNB_FALLBACK_SEARCH_URL = `${AIRBNB_BASE_ORIGIN}/s/London--United-Kingdom/homes`;
 const MAX_URL_EXTRACTION_DEPTH = 3;
@@ -108,6 +116,63 @@ const compact = (value) => {
 };
 
 const asArray = (value) => (Array.isArray(value) ? value : []);
+
+const sleep = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+});
+
+const randomInt = (min, max) => Math.floor(min + (Math.random() * ((max - min) + 1)));
+
+const sleepJitter = async (minMs, maxMs) => {
+    await sleep(randomInt(minMs, maxMs));
+};
+
+const getCaseInsensitiveEntry = (object, key) => {
+    if (!object || typeof object !== 'object' || Array.isArray(object)) return undefined;
+    const expected = String(key).toLowerCase();
+    return Object.entries(object).find(([name]) => name.toLowerCase() === expected);
+};
+
+const getCaseInsensitiveValue = (object, key) => getCaseInsensitiveEntry(object, key)?.[1];
+
+const getPathCaseInsensitive = (object, path) => {
+    let current = object;
+    for (const key of path) {
+        current = getCaseInsensitiveValue(current, key);
+        if (current === undefined || current === null) return undefined;
+    }
+
+    return current;
+};
+
+const getRawParamAlias = (name) => {
+    const normalized = cleanString(name);
+    if (!normalized) return undefined;
+    const direct = RAW_PARAM_ALIASES[normalized];
+    if (direct) return direct;
+
+    const lower = normalized.toLowerCase();
+    const aliasEntry = Object.entries(RAW_PARAM_ALIASES).find(([alias, canonical]) => (
+        alias.toLowerCase() === lower || canonical.toLowerCase() === lower
+    ));
+    return aliasEntry?.[1] || normalized;
+};
+
+const getSearchParamCaseInsensitive = (searchParams, names) => {
+    const expected = asArray(names).map((name) => String(name).toLowerCase());
+    for (const [key, value] of searchParams.entries()) {
+        if (expected.includes(key.toLowerCase())) return value;
+    }
+
+    return undefined;
+};
+
+const deleteSearchParamsCaseInsensitive = (searchParams, names) => {
+    const expected = new Set(asArray(names).map((name) => String(name).toLowerCase()));
+    for (const key of Array.from(searchParams.keys())) {
+        if (expected.has(key.toLowerCase())) searchParams.delete(key);
+    }
+};
 
 const decodeRepeatedURIComponent = (value, maxDepth = 3) => {
     let current = value;
@@ -294,11 +359,13 @@ const computeAutoMaxPages = (targetCount) => {
 const extractNumericIdFromUrl = (urlString) => {
     try {
         const parsed = new URL(urlString);
-        const fromParam = parsed.searchParams.get('room_id')
-            || parsed.searchParams.get('roomId')
-            || parsed.searchParams.get('listing_id')
-            || parsed.searchParams.get('listingId')
-            || parsed.searchParams.get('propertyId');
+        const fromParam = getSearchParamCaseInsensitive(parsed.searchParams, [
+            'room_id',
+            'roomId',
+            'listing_id',
+            'listingId',
+            'propertyId',
+        ]);
         const fromParamMatch = fromParam?.match(/(\d{6,})/);
         if (fromParamMatch?.[1]) return fromParamMatch[1];
 
@@ -359,13 +426,18 @@ const fetchText = async ({ url, proxyConfiguration, accept = 'text/html,applicat
         'user-agent': AIRBNB_USER_AGENT,
         accept,
         'accept-language': 'en-US,en;q=0.9',
+        'sec-fetch-site': 'none',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-user': '?1',
+        'sec-fetch-dest': 'document',
     },
     timeout: { request: 30000 },
     retry: { limit: 2 },
+    useHeaderGenerator: false,
 });
 
 const extractApiKeyFromHtml = (html) => {
-    const match = html.match(/"api_config"\s*:\s*\{[\s\S]{0,600}?"key"\s*:\s*"([^"]+)"/);
+    const match = html.match(/"api_config"\s*:\s*\{[\s\S]{0,600}?"key"\s*:\s*"([^"]+)"/i);
     return cleanString(match?.[1]);
 };
 
@@ -375,12 +447,15 @@ const extractDeferredVariables = (html) => {
 
     try {
         const payload = JSON.parse(scriptMatch[1]);
-        const niobeClientData = asArray(payload?.niobeClientData);
-        const staysSearchEntry = niobeClientData.find((entry) => typeof entry?.[0] === 'string' && entry[0].startsWith('StaysSearch:'));
+        const niobeClientData = asArray(getCaseInsensitiveValue(payload, 'niobeClientData'));
+        const staysSearchEntry = niobeClientData.find((entry) => (
+            typeof entry?.[0] === 'string'
+            && entry[0].toLowerCase().startsWith(`${STAYS_SEARCH_OPERATION_NAME.toLowerCase()}:`)
+        ));
         if (!staysSearchEntry) return undefined;
 
         const key = String(staysSearchEntry[0]);
-        const variables = JSON.parse(key.slice('StaysSearch:'.length));
+        const variables = JSON.parse(key.slice(STAYS_SEARCH_OPERATION_NAME.length + 1));
         return variables && typeof variables === 'object' ? variables : undefined;
     } catch {
         return undefined;
@@ -517,18 +592,20 @@ const buildRawParamsFromInput = ({ url, adults }) => {
     if (!explicitUrl) return [];
 
     const parsed = new URL(explicitUrl);
-    parsed.searchParams.delete('source_impression_id');
-    parsed.searchParams.delete('source');
-    parsed.searchParams.delete('tracking_id');
-    parsed.searchParams.delete('guests');
-    parsed.searchParams.delete('children');
-    parsed.searchParams.delete('infants');
-    parsed.searchParams.delete('pets');
+    deleteSearchParamsCaseInsensitive(parsed.searchParams, [
+        'source_impression_id',
+        'source',
+        'tracking_id',
+        'guests',
+        'children',
+        'infants',
+        'pets',
+    ]);
     const grouped = new Map();
 
     parsed.searchParams.forEach((value, key) => {
         const normalizedKey = key.replace(/\[\]$/g, '');
-        const canonicalKey = RAW_PARAM_ALIASES[normalizedKey] || normalizedKey;
+        const canonicalKey = getRawParamAlias(normalizedKey);
         if (!grouped.has(canonicalKey)) grouped.set(canonicalKey, []);
         grouped.get(canonicalKey).push(String(value));
     });
@@ -564,10 +641,10 @@ const normalizeRawParams = (rawParamsInput) => {
 
     for (const entry of input) {
         if (!entry || typeof entry !== 'object') continue;
-        const rawFilterName = cleanString(entry.filterName);
-        const filterName = rawFilterName ? (RAW_PARAM_ALIASES[rawFilterName] || rawFilterName) : undefined;
+        const rawFilterName = cleanString(getCaseInsensitiveValue(entry, 'filterName'));
+        const filterName = getRawParamAlias(rawFilterName);
         if (!filterName) continue;
-        const filterValues = asArray(entry.filterValues).map((item) => String(item));
+        const filterValues = asArray(getCaseInsensitiveValue(entry, 'filterValues')).map((item) => String(item));
         if (!filterValues.length) continue;
         out.push({ filterName, filterValues });
     }
@@ -591,9 +668,9 @@ const buildSearchVariables = ({ rawParams }) => {
 };
 
 const setRawParamValue = (rawParamsInput, name, value) => {
-    const canonicalName = RAW_PARAM_ALIASES[name] || name;
+    const canonicalName = getRawParamAlias(name);
     const rawParams = asArray(rawParamsInput).map((entry) => ({ ...entry }));
-    const idx = rawParams.findIndex((entry) => entry?.filterName === canonicalName);
+    const idx = rawParams.findIndex((entry) => cleanString(getCaseInsensitiveValue(entry, 'filterName'))?.toLowerCase() === canonicalName.toLowerCase());
 
     if (value === undefined || value === null || value === '') {
         if (idx >= 0) rawParams.splice(idx, 1);
@@ -613,11 +690,15 @@ const setRawParamValue = (rawParamsInput, name, value) => {
 const applyCursorToVariables = (variables, cursor) => {
     if (!cursor) return;
 
-    for (const requestObject of [variables?.staysSearchRequest, variables?.staysMapSearchRequestV2]) {
+    for (const requestObject of [
+        getCaseInsensitiveValue(variables, 'staysSearchRequest'),
+        getCaseInsensitiveValue(variables, 'staysMapSearchRequestV2'),
+    ]) {
         if (!requestObject || typeof requestObject !== 'object') continue;
         // Airbnb StaysSearch expects token pagination through `cursor`,
         // not raw numeric offset params. Offsets cause page loops/duplication.
-        const withoutLegacySection = setRawParamValue(requestObject.rawParams, 'section_offset', undefined);
+        const rawParams = getCaseInsensitiveValue(requestObject, 'rawParams');
+        const withoutLegacySection = setRawParamValue(rawParams, 'section_offset', undefined);
         const withoutLegacyItems = setRawParamValue(withoutLegacySection, 'items_offset', undefined);
         const withoutCamelSection = setRawParamValue(withoutLegacyItems, 'sectionOffset', undefined);
         const withoutCamelItems = setRawParamValue(withoutCamelSection, 'itemsOffset', undefined);
@@ -633,9 +714,12 @@ const decodeCursorPayload = (cursor) => {
 
     try {
         const parsed = JSON.parse(decoded);
-        const sectionOffset = Number.isFinite(parsed?.section_offset) ? parsed.section_offset : 0;
-        const itemsOffset = Number.isFinite(parsed?.items_offset) ? parsed.items_offset : undefined;
-        const version = Number.isFinite(parsed?.version) ? parsed.version : DEFAULT_CURSOR_VERSION;
+        const rawSectionOffset = getCaseInsensitiveValue(parsed, 'section_offset') ?? getCaseInsensitiveValue(parsed, 'sectionOffset');
+        const rawItemsOffset = getCaseInsensitiveValue(parsed, 'items_offset') ?? getCaseInsensitiveValue(parsed, 'itemsOffset');
+        const rawVersion = getCaseInsensitiveValue(parsed, 'version');
+        const sectionOffset = Number.isFinite(rawSectionOffset) ? rawSectionOffset : 0;
+        const itemsOffset = Number.isFinite(rawItemsOffset) ? rawItemsOffset : undefined;
+        const version = Number.isFinite(rawVersion) ? rawVersion : DEFAULT_CURSOR_VERSION;
         if (itemsOffset === undefined) return undefined;
         return {
             sectionOffset,
@@ -668,15 +752,19 @@ const getCursorOffset = (cursor) => {
 };
 
 const getItemsPerGrid = (baseVariables) => {
-    const rawParams = asArray(baseVariables?.staysSearchRequest?.rawParams);
-    const found = rawParams.find((entry) => entry?.filterName === 'itemsPerGrid' || entry?.filterName === 'items_per_grid');
-    const value = found?.filterValues?.[0];
+    const request = getCaseInsensitiveValue(baseVariables, 'staysSearchRequest');
+    const rawParams = asArray(getCaseInsensitiveValue(request, 'rawParams'));
+    const found = rawParams.find((entry) => {
+        const filterName = getRawParamAlias(getCaseInsensitiveValue(entry, 'filterName'));
+        return filterName === 'itemsPerGrid';
+    });
+    const value = getCaseInsensitiveValue(found, 'filterValues')?.[0];
     return safePositiveInt(value, DEFAULT_RESULTS_PER_PAGE_ESTIMATE);
 };
 
 // Adds discovered cursors into a queue, deduped by canonical offset key and ordered by offset.
 const collectCursors = (paginationInfo, queue, queuedCursorKeys, visitedCursorKeys, maxObservedItemsOffset) => {
-    const pages = asArray(paginationInfo?.pageCursors).map((c) => cleanString(c)).filter(Boolean);
+    const pages = asArray(getCaseInsensitiveValue(paginationInfo, 'pageCursors')).map((c) => cleanString(c)).filter(Boolean);
 
     for (const c of pages) {
         const key = getCursorKey(c);
@@ -761,9 +849,13 @@ const buildRequestHeaderProfiles = ({ apiKey, referer, headerHints }) => {
     };
 
     return [
-        mergeHeaders(base, headerHints),
-        mergeHeaders(base, HEALABLE_HEADER_DEFAULTS, headerHints),
-        mergeHeaders(base, HEALABLE_HEADER_DEFAULTS, headerHints, softBrowserHeaders),
+        mergeHeaders(base, HEALABLE_HEADER_DEFAULTS, softBrowserHeaders, headerHints),
+        mergeHeaders(base, { 'user-agent': AIRBNB_DESKTOP_USER_AGENT }, HEALABLE_HEADER_DEFAULTS, softBrowserHeaders, headerHints),
+        mergeHeaders(base, {
+            'user-agent': AIRBNB_ANDROID_APP_USER_AGENT,
+            'accept-language': 'en-US',
+            'x-requested-with': 'com.airbnb.android',
+        }, headerHints),
     ];
 };
 
@@ -797,6 +889,68 @@ const parseResponseError = ({ response, fallbackMessage }) => {
     return { json };
 };
 
+const isTransientError = (error) => {
+    const statusCode = Number(error?.statusCode || error?.response?.statusCode);
+    if (statusCode === 408 || statusCode === 429 || statusCode >= 500) return true;
+
+    const code = cleanString(error?.code)?.toUpperCase();
+    if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND'].includes(code)) return true;
+
+    const text = cleanString(error?.message)?.toLowerCase() || '';
+    return text.includes('timeout') || text.includes('timed out') || text.includes('socket hang up');
+};
+
+const isRateLimitError = (error) => Number(error?.statusCode || error?.response?.statusCode) === 429;
+
+const getRetryDelayMs = (attempt, error) => {
+    const retryAfter = Number(error?.response?.headers?.['retry-after'] || error?.headers?.['retry-after']);
+    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+        return Math.min(retryAfter * 1000, API_RATE_LIMIT_MAX_DELAY_MS);
+    }
+
+    if (isRateLimitError(error)) {
+        return randomInt(API_RATE_LIMIT_MIN_DELAY_MS, API_RATE_LIMIT_MAX_DELAY_MS);
+    }
+
+    const base = API_REQUEST_RETRY_BASE_MS * (2 ** (attempt - 1));
+    return randomInt(base, Math.min(base * 2, 12000));
+};
+
+const requestWithBackoff = async ({ url, proxyConfiguration, headers }) => {
+    let lastError;
+
+    for (let attempt = 1; attempt <= API_REQUEST_MAX_ATTEMPTS; attempt++) {
+        try {
+            const response = await gotScraping.get(url, {
+                proxyUrl: await maybeProxyUrl(proxyConfiguration),
+                headers,
+                timeout: { request: 45000 },
+                retry: { limit: 0 },
+                throwHttpErrors: false,
+                useHeaderGenerator: false,
+            });
+
+            const parsed = parseResponseError({
+                response,
+                fallbackMessage: 'Invalid JSON from Airbnb API',
+            });
+
+            if (parsed?.json) return parsed.json;
+            lastError = parsed;
+        } catch (error) {
+            lastError = error;
+        }
+
+        if (!isTransientError(lastError) || attempt >= API_REQUEST_MAX_ATTEMPTS) break;
+
+        const delayMs = getRetryDelayMs(attempt, lastError);
+        log.warning(`Temporary Airbnb API failure (${lastError.message}); retrying in ${delayMs}ms.`);
+        await sleep(delayMs);
+    }
+
+    throw lastError || new Error('Airbnb API request failed.');
+};
+
 const requestJson = async ({ url, apiKey, proxyConfiguration, referer, headerHints = {} }) => {
     const profiles = buildRequestHeaderProfiles({ apiKey, referer, headerHints });
     const attempted = new Set();
@@ -807,21 +961,15 @@ const requestJson = async ({ url, apiKey, proxyConfiguration, referer, headerHin
         if (attempted.has(signature)) continue;
         attempted.add(signature);
 
-        const response = await gotScraping.get(url, {
-            proxyUrl: await maybeProxyUrl(proxyConfiguration),
-            headers,
-            timeout: { request: 45000 },
-            retry: { limit: 2 },
-            throwHttpErrors: false,
-        });
-
-        const parsed = parseResponseError({
-            response,
-            fallbackMessage: 'Invalid JSON from Airbnb API',
-        });
-
-        if (parsed?.json) return parsed.json;
-        lastError = parsed;
+        try {
+            return await requestWithBackoff({ url, proxyConfiguration, headers });
+        } catch (error) {
+            lastError = error;
+            if (isTransientError(error)) {
+                log.warning(`Airbnb API request failed after retries for one header profile: ${error.message}`);
+                if (isRateLimitError(error)) break;
+            }
+        }
     }
 
     throw lastError || new Error('Airbnb API request failed for all header profiles.');
@@ -866,6 +1014,15 @@ const isHeaderIssue = (error) => {
         || text.includes('forbidden')
         || text.includes('bad request')
         || text.includes('invalid_request');
+};
+
+const getStaysSearchResults = (json, sourceLabel) => {
+    const results = getPathCaseInsensitive(json, ['data', 'presentation', 'staysSearch', 'results']);
+    if (results && typeof results === 'object') return results;
+
+    const rootKeys = json && typeof json === 'object' ? Object.keys(json).join(', ') : typeof json;
+    log.warning(`[${sourceLabel}] Airbnb API response did not include staysSearch results. Top-level keys: ${rootKeys || 'none'}.`);
+    return {};
 };
 
 const getBootstrapData = async ({ seedUrl, proxyConfiguration }) => {
@@ -1099,6 +1256,10 @@ const fetchListings = async ({
         // Mark current cursor used so we never re-request the same page.
         visitedCursorKeys.add(getCursorKey(currentCursor));
 
+        if (page > 1) {
+            await sleepJitter(API_REQUEST_MIN_DELAY_MS, API_REQUEST_MAX_DELAY_MS);
+        }
+
         const variables = buildVariablesForPage(baseVariables, currentCursor);
 
         const runRequest = async () => requestJson({
@@ -1149,8 +1310,8 @@ const fetchListings = async ({
             json = await runRequest();
         }
 
-        const results = json?.data?.presentation?.staysSearch?.results;
-        const items = asArray(results?.searchResults);
+        const results = getStaysSearchResults(json, sourceLabel);
+        const items = asArray(getCaseInsensitiveValue(results, 'searchResults'));
 
         const currentCursorPayload = decodeCursorPayload(currentCursor);
         if (Number.isFinite(currentCursorPayload?.itemsOffset)) {
@@ -1159,15 +1320,16 @@ const fetchListings = async ({
 
         // Harvest cursor tokens before item handling so queue state is always current.
         collectCursors(
-            results?.paginationInfo,
+            getCaseInsensitiveValue(results, 'paginationInfo'),
             cursorQueue,
             queuedCursorKeys,
             visitedCursorKeys,
             maxObservedItemsOffset,
         );
-        const directNextCursor = cleanString(results?.paginationInfo?.nextPageCursor);
+        const paginationInfo = getCaseInsensitiveValue(results, 'paginationInfo');
+        const directNextCursor = cleanString(getCaseInsensitiveValue(paginationInfo, 'nextPageCursor'));
 
-        const observedCursors = asArray(results?.paginationInfo?.pageCursors)
+        const observedCursors = asArray(getCaseInsensitiveValue(paginationInfo, 'pageCursors'))
             .map((cursor) => decodeCursorPayload(cleanString(cursor)))
             .filter(Boolean);
         for (const payload of observedCursors) {
@@ -1183,8 +1345,17 @@ const fetchListings = async ({
             const newRowsThisPage = [];
 
             for (const item of items) {
-                const mapped = mapListingItem({ item, rank: rows.length + 1, searchContext });
-                if (!mapped) continue;
+                let mapped;
+                try {
+                    mapped = mapListingItem({ item, rank: rows.length + 1, searchContext });
+                } catch (error) {
+                    log.warning(`[${sourceLabel}] skipped malformed listing item: ${error.message}`);
+                    continue;
+                }
+                if (!mapped) {
+                    log.debug(`[${sourceLabel}] skipped empty listing item.`);
+                    continue;
+                }
 
                 const dedupKey = buildDedupKey(mapped);
                 if (dedupKey && seenListingKeys.has(dedupKey)) continue;
@@ -1345,50 +1516,55 @@ await Actor.main(async () => {
 
         log.info(`[${sourceLabel}] target=${remainingTarget}, autoMaxPages=${sourceMaxPages}`);
 
-        // Refresh source bootstrap/deferred variables while retaining healed API context.
-        const sourceContext = await refreshAirbnbApiContext({
-            seedUrl: sourceSeedUrl,
-            proxyConfiguration: proxyConfig,
-            existingContext: apiContext,
-            refreshHash: false,
-            refreshKey: false,
-            refreshHeaders: false,
-        });
+        try {
+            // Refresh source bootstrap/deferred variables while retaining healed API context.
+            const sourceContext = await refreshAirbnbApiContext({
+                seedUrl: sourceSeedUrl,
+                proxyConfiguration: proxyConfig,
+                existingContext: apiContext,
+                refreshHash: false,
+                refreshKey: false,
+                refreshHeaders: false,
+            });
 
-        Object.assign(apiContext, sourceContext);
+            Object.assign(apiContext, sourceContext);
 
-        const sourceDeferredVariables = sourceContext.deferredVariables && typeof sourceContext.deferredVariables === 'object'
-            ? sourceContext.deferredVariables
-            : undefined;
-        const baseVariables = sourceDeferredVariables || buildSearchVariables({
-            rawParams: buildRawParamsFromInput({ url: source.runtimeUrl, adults }),
-        });
+            const sourceDeferredVariables = sourceContext.deferredVariables && typeof sourceContext.deferredVariables === 'object'
+                ? sourceContext.deferredVariables
+                : undefined;
+            const baseVariables = sourceDeferredVariables || buildSearchVariables({
+                rawParams: buildRawParamsFromInput({ url: source.runtimeUrl, adults }),
+            });
 
-        const onBatchSaved = createBatchSaver({
-            globalSeenListingKeys,
-            resultsWanted,
-            savedState: globalState,
-        });
+            const onBatchSaved = createBatchSaver({
+                globalSeenListingKeys,
+                resultsWanted,
+                savedState: globalState,
+            });
 
-        const sourceResult = await fetchListings({
-            targetCount: remainingTarget,
-            maxPages: sourceMaxPages,
-            locale: cleanString(locale) || DEFAULT_LOCALE,
-            currency: cleanString(currency) || DEFAULT_CURRENCY,
-            apiContext,
-            proxyConfiguration: proxyConfig,
-            searchContext: source.runtimeUrl || sourceSeedUrl || source.inputValue,
-            seedUrl: sourceSeedUrl,
-            baseVariables,
-            sourceLabel,
-            onBatchSaved,
-        });
+            const sourceResult = await fetchListings({
+                targetCount: remainingTarget,
+                maxPages: sourceMaxPages,
+                locale: cleanString(locale) || DEFAULT_LOCALE,
+                currency: cleanString(currency) || DEFAULT_CURRENCY,
+                apiContext,
+                proxyConfiguration: proxyConfig,
+                searchContext: source.runtimeUrl || sourceSeedUrl || source.inputValue,
+                seedUrl: sourceSeedUrl,
+                baseVariables,
+                sourceLabel,
+                onBatchSaved,
+            });
 
-        log.info(`[${sourceLabel}] contributed ${sourceResult.persistedCount} listing(s), global total ${globalState.savedCount}/${resultsWanted}.`);
+            log.info(`[${sourceLabel}] contributed ${sourceResult.persistedCount} listing(s), global total ${globalState.savedCount}/${resultsWanted}.`);
+        } catch (error) {
+            log.warning(`[${sourceLabel}] skipped after recoverable failure: ${error.message}`);
+        }
     }
 
     if (!globalState.savedCount) {
-        throw new Error('No listings found. Try another Airbnb search URL or broader search filters.');
+        log.warning('No listings were saved. Try another Airbnb search URL or broader search filters.');
+        return;
     }
 
     log.info(`Saved ${globalState.savedCount} listing(s).`);
