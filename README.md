@@ -1,103 +1,148 @@
-# Airbnb Listings Scraper
+## What does Airbnb Listings Scraper do?
 
-Extract Airbnb listings and property-level details at scale using search URLs. Build clean datasets with ranking, pricing, ratings, host details, and location metadata for analytics and market intelligence.
+Airbnb Listings Scraper extracts structured listing data from Airbnb search result pages. Add one or more Airbnb `/s/.../homes` search URLs, choose how many results you want, and get clean records with listing IDs, URLs, titles, room types, cities, guest capacity, ratings, review counts, pricing text, coordinates, badges, images, and search rank.
 
----
+This Airbnb scraper is useful for short-term rental market research, competitor monitoring, pricing analysis, destination research, and building property datasets for BI dashboards, spreadsheets, AI agents, or internal data pipelines.
 
-## Features
+## Why use Airbnb Listings Scraper?
 
-- **API-first extraction** — Collects Airbnb listing and property data from the listing API response.
-- **Flexible inputs** — Run using a full Airbnb search URL.
-- **Cursor pagination** — Automatically follows Airbnb pagination cursors to collect more listings.
-- **Null-free dataset output** — Excludes empty fields to keep records clean and analysis-ready.
-- **Auto-healing runtime context** — Refreshes API key and operation hash context when request shape changes.
+- **Market research without manual copy-paste** - Collect Airbnb listing data from selected cities, neighborhoods, dates, and guest filters.
+- **Search URL based collection** - Use the same Airbnb search URLs your team already works with, including query parameters for stay dates, guests, and location context.
+- **Multiple market support** - Process more than one Airbnb search URL in a single run until your requested result limit is reached.
+- **Analysis-ready output** - Export structured records to JSON, CSV, Excel, XML, Google Sheets, or your own systems.
+- **Monitoring workflows** - Schedule repeat runs to compare pricing, rating, ranking, and inventory changes over time.
+- **Clean records** - Dataset items include available fields only, so downstream analysis does not have to deal with empty values.
 
----
+## What data can you extract from Airbnb?
 
-## Use Cases
+| Field | Description |
+|-------|-------------|
+| `listing_id` | Airbnb listing numeric identifier. |
+| `listing_url` | Direct URL to the Airbnb room or property page. |
+| `title` | Listing title shown in Airbnb search results. |
+| `subtitle` | Short listing subtitle, such as bed or stay summary. |
+| `name_localized` | Localized listing name when available. |
+| `room_type` | Property or room type, such as entire rental unit or private room. |
+| `city` | City or localized place name connected to the listing. |
+| `category` | Airbnb room or property category label when available. |
+| `bed_label` | Short bed, room, or layout summary. |
+| `person_capacity` | Maximum guest capacity published for the listing. |
+| `is_superhost` | Whether the host is marked as a superhost when available. |
+| `host_name` | Host name when available in the search result data. |
+| `latitude` | Listing latitude for mapping and geo analysis. |
+| `longitude` | Listing longitude for mapping and geo analysis. |
+| `rating` | Average rating score. |
+| `reviews_count` | Number of reviews parsed from the listing rating text. |
+| `rating_label` | Rating label text when provided by Airbnb. |
+| `nightly_price` | Primary displayed nightly price. |
+| `nightly_price_qualifier` | Price qualifier, such as the stay length label. |
+| `price_accessibility_label` | Expanded price text when available. |
+| `total_price_line` | Secondary total price or summary line. |
+| `price_display_style` | Price display style label when available. |
+| `review_snippet` | Short review snippet from the listing card. |
+| `badges` | Listing badge labels, such as guest favorite or rare find. |
+| `image_urls` | Image URLs from the listing card. |
+| `search_rank` | Rank order in the collected Airbnb search results. |
+| `search_context` | Airbnb search URL used as the source context. |
+| `fetched_at` | ISO timestamp for when the listing was collected. |
 
-### Short-Term Rental Market Research
-Track active inventory, pricing, and listing quality in target cities or neighborhoods.
+## How to scrape Airbnb listing data
 
-### Competitive Benchmarking
-Compare listing rankings, rating signals, and host characteristics across markets.
-
-### Dynamic Pricing Analysis
-Monitor nightly and total displayed prices across different search filters and dates.
-
-### Data Pipeline Enrichment
-Feed property datasets into BI tools, forecasting workflows, and automated reporting systems.
-
----
+1. Open Airbnb and create a search for your target location, dates, guest count, and filters.
+2. Copy the Airbnb search URL from your browser address bar.
+3. Open Airbnb Listings Scraper on Apify.
+4. Paste one or more URLs into `urls`.
+5. Set `results_wanted` to the maximum number of listings you want to save.
+6. Run the Actor.
+7. Download the dataset or connect it to your workflow.
 
 ## Input Parameters
 
 | Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `url` | String | No | London search prefill | Preferred input. Any Airbnb search URL from `/s/.../homes`. |
-| `results_wanted` | Integer | No | `20` | Maximum number of listing records to save. |
-| `max_pages` | Integer | No | `5` | Safety cap for pagination depth. |
-| `proxyConfiguration` | Object | No | Residential Apify Proxy | Proxy settings for reliability and stability. |
-
----
+|-----------|------|----------|---------|-------------|
+| `urls` | Array of strings | No | London search URL prefill | One or more Airbnb `/s/.../homes` search URLs. The Actor processes the URLs until `results_wanted` is reached or all sources are exhausted. |
+| `results_wanted` | Integer | No | `20` | Maximum number of unique listing records to save. Minimum value is `1`. |
+| `proxyConfiguration` | Object | No | `{ "useApifyProxy": false }` | Optional Apify Proxy settings for runs that need proxy routing. |
 
 ## Output Data
 
-Each dataset item contains available listing/property metadata without empty/null fields.
+Each dataset item represents one Airbnb listing from the supplied search context. Fields may be omitted when Airbnb does not publish that value for a listing.
 
 | Field | Type | Description |
-|---|---|---|
+|-------|------|-------------|
 | `listing_id` | String | Airbnb listing numeric identifier. |
-| `listing_url` | String | Airbnb listing URL. |
-| `title` | String | Listing title text. |
-| `subtitle` | String | Listing subtitle text. |
+| `listing_url` | String | Direct Airbnb listing URL. |
+| `title` | String | Listing title. |
+| `subtitle` | String | Listing subtitle. |
 | `name_localized` | String | Localized listing name. |
-| `room_type` | String | Home or room type. |
-| `city` | String | Localized city for the listing. |
-| `category` | String | Airbnb room/property category label. |
-| `person_capacity` | Number | Maximum supported guests. |
+| `room_type` | String | Property room or home type. |
+| `city` | String | Localized city or place name. |
+| `category` | String | Airbnb room or property category label. |
+| `bed_label` | String | Bed or room summary label. |
+| `person_capacity` | Number | Maximum number of guests. |
 | `is_superhost` | Boolean | Host superhost status when available. |
 | `host_name` | String | Host name when available. |
 | `latitude` | Number | Listing latitude. |
 | `longitude` | Number | Listing longitude. |
-| `rating` | Number | Average rating value. |
-| `reviews_count` | Number | Number of reviews parsed from rating text. |
-| `nightly_price` | String | Primary displayed nightly price. |
-| `total_price_line` | String | Secondary displayed total/summary line. |
+| `rating` | Number | Average rating score. |
+| `reviews_count` | Number | Number of reviews. |
+| `rating_label` | String | Rating label text. |
+| `nightly_price` | String | Primary nightly price text. |
+| `nightly_price_qualifier` | String | Nightly price qualifier text. |
+| `price_accessibility_label` | String | Expanded price text when available. |
+| `total_price_line` | String | Secondary total price line. |
+| `price_display_style` | String | Price presentation style. |
+| `review_snippet` | String | Short review snippet. |
 | `badges` | Array | Listing badge labels. |
-| `image_urls` | Array | Image URLs from contextual listing pictures. |
+| `image_urls` | Array | Listing image URLs. |
 | `search_rank` | Number | Rank order in collected search results. |
-| `search_context` | String | URL context used in the run. |
-| `fetched_at` | String | Extraction timestamp. |
-
----
+| `search_context` | String | Airbnb search URL used for the run. |
+| `fetched_at` | String | Collection timestamp in ISO format. |
 
 ## Usage Examples
 
-### Search URL Input
+### Basic Airbnb Search Extraction
+
+Collect 20 listings from one Airbnb search URL:
 
 ```json
 {
-  "url": "https://www.airbnb.com/s/London--United-Kingdom/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1",
-  "results_wanted": 20,
-  "max_pages": 5
+  "urls": [
+    "https://www.airbnb.com/s/London--United-Kingdom/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1"
+  ],
+  "results_wanted": 20
 }
 ```
 
-### Proxy Configuration
+### Multiple Airbnb Search URLs
+
+Collect listings from more than one market in the same run:
 
 ```json
 {
-  "url": "https://www.airbnb.com/s/London--United-Kingdom/homes",
-  "results_wanted": 20,
+  "urls": [
+    "https://www.airbnb.com/s/London--United-Kingdom/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1",
+    "https://www.airbnb.com/s/Paris--France/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1"
+  ],
+  "results_wanted": 50
+}
+```
+
+### Larger Run With Proxy Configuration
+
+Use Apify Proxy settings when running larger Airbnb collection jobs:
+
+```json
+{
+  "urls": [
+    "https://www.airbnb.com/s/New-York--NY--United-States/homes?checkin=2026-06-10&checkout=2026-06-15&adults=2"
+  ],
+  "results_wanted": 100,
   "proxyConfiguration": {
-    "useApifyProxy": true,
-    "apifyProxyGroups": ["RESIDENTIAL"]
+    "useApifyProxy": true
   }
 }
 ```
-
----
 
 ## Sample Output
 
@@ -110,83 +155,93 @@ Each dataset item contains available listing/property metadata without empty/nul
   "name_localized": "Amazing location by tube",
   "room_type": "Entire rental unit",
   "city": "London",
+  "category": "Apartment",
+  "bed_label": "2 beds",
   "person_capacity": 4,
+  "is_superhost": true,
+  "host_name": "Alex",
+  "latitude": 51.5072,
+  "longitude": -0.1276,
   "rating": 4.93,
   "reviews_count": 165,
+  "rating_label": "Rated 4.93 out of 5 from 165 reviews",
   "nightly_price": "$61",
   "nightly_price_qualifier": "for 1 night",
+  "total_price_line": "$61 total",
+  "badges": [
+    "Guest favorite"
+  ],
+  "image_urls": [
+    "https://a0.muscache.com/im/pictures/example.jpg"
+  ],
   "search_rank": 1,
   "search_context": "https://www.airbnb.com/s/London--United-Kingdom/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1",
-  "fetched_at": "2026-04-22T12:30:00.000Z"
+  "fetched_at": "2026-07-29T12:30:00.000Z"
 }
 ```
 
----
+## Tips for Best Results
 
-## Tips For Best Results
-
-### Prefer Direct Search URLs
-Use full Airbnb search URLs for the most deterministic filter and location behavior.
-
-### Start With QA-Sized Runs
-Run with `results_wanted: 20` and low `max_pages` first, then increase for production jobs.
-
-### Enable Residential Proxy
-For best reliability across larger paginated runs, keep residential proxy enabled.
-
-### Use Real Date Context
-When analyzing pricing and availability snapshots, use Airbnb search URLs that already include realistic dates.
-
----
+- Use complete Airbnb search URLs copied from your browser after setting location, dates, guests, and filters.
+- Start with `results_wanted: 20` to confirm the search returns the fields you need.
+- Use separate URLs for different cities, neighborhoods, date ranges, or guest counts.
+- Keep date filters realistic when collecting pricing and availability snapshots.
+- Increase `results_wanted` gradually for larger markets.
+- Enable proxy settings when running larger or scheduled collection jobs.
+- If some fields are missing, check the original Airbnb search results. Not every listing publishes the same details in search.
 
 ## Integrations
 
-- **Google Sheets** — Build listing and pricing trackers.
-- **Airtable** — Create searchable property intelligence databases.
-- **Looker Studio / BI tools** — Visualize ranking, rating, and pricing trends.
-- **Make / Zapier** — Trigger automated workflows from fresh listing datasets.
-- **Webhooks** — Send output to internal APIs and downstream services.
-
-### Export Formats
-
-- **JSON** — For APIs and programmatic workflows.
-- **CSV** — For spreadsheet analysis.
-- **Excel** — For business reporting.
-- **XML** — For compatible legacy systems.
-
----
+- **Google Sheets** - Send Airbnb listing data to spreadsheets for quick review and sharing.
+- **CSV and Excel** - Download datasets for market research, pricing models, and reporting.
+- **JSON** - Use structured output in apps, dashboards, and AI or RAG workflows.
+- **Webhooks** - Trigger downstream processes after each run finishes.
+- **Make or Zapier** - Connect new listing data to no-code automation workflows.
+- **API** - Access datasets programmatically from your own systems.
 
 ## Frequently Asked Questions
 
-### What happens if I do not provide a URL?
-The actor uses `INPUT.json` as a local fallback. On Apify production runs, pass a real Airbnb search URL for deterministic behavior.
+### Can I export Airbnb listing data to CSV or Excel?
 
-### Does the actor support pagination?
-Yes. It follows Airbnb cursor-based pagination until `results_wanted` or `max_pages` is reached.
+Yes. Apify datasets can be downloaded in CSV, Excel, JSON, XML, and other supported formats.
 
-### What happens if the API key or operation hash changes?
-The actor refreshes runtime API context automatically and retries the request.
+### Can I scrape more than one Airbnb location in one run?
 
-### Are null fields included in output?
-No. Empty and null values are removed before records are saved.
+Yes. Add multiple Airbnb search URLs to `urls`. The Actor processes them in order until it reaches `results_wanted` or all sources are exhausted.
 
-### Can I use long URLs with many query parameters?
-Yes. The actor accepts full Airbnb search URLs with query parameters and uses them as search context.
+### Can I control dates, guests, and filters?
 
----
+Yes. Set the dates, guests, and filters on Airbnb first, then copy the resulting search URL into `urls`.
+
+### Does this Actor collect detailed property page data?
+
+The Actor focuses on listing data available from Airbnb search result contexts. It is best for market-level datasets, ranking analysis, pricing snapshots, and property discovery.
+
+### Why are some output fields missing?
+
+Some fields may be missing because Airbnb does not publish the same values for every listing or search result. The Actor saves available fields and leaves unavailable fields out of the record.
+
+### Can I run Airbnb Listings Scraper on a schedule?
+
+Yes. Use Apify schedules to run the Actor hourly, daily, weekly, or at another interval for monitoring workflows.
+
+### Is this Airbnb scraper suitable for non-technical users?
+
+Yes. You can run it from Apify Console with form-based inputs, then download the dataset without writing code.
+
+### Is it legal to scrape Airbnb?
+
+Scraping public web data can be legal, but you are responsible for complying with applicable laws, Airbnb's terms, privacy rules, and any restrictions that apply to your use case.
+
+## Related Actors
+
+- [Airbnb Reviews Scraper](https://apify.com/shahidirfan/airbnb-reviews-scraper) - Extract Airbnb stay reviews using room URLs or property IDs for reputation monitoring and guest feedback analysis.
+- [VRBO Property Scraper](https://apify.com/shahidirfan/vrbo-property-scraper) - Collect vacation rental listings from VRBO for rental market research and competitor tracking.
 
 ## Support
 
-For issues, enhancements, or feature requests, open a ticket via Apify Console.
-
-### Resources
-
-- [Apify Documentation](https://docs.apify.com/)
-- [Apify API Reference](https://docs.apify.com/api/v2)
-- [Apify Schedules](https://docs.apify.com/platform/schedules)
-
----
+For issues, feature requests, or custom Airbnb data extraction work, use the Issues tab on the Actor page or contact the developer through Apify.
 
 ## Legal Notice
 
-This actor is intended for legitimate data collection and analysis workflows. Users are responsible for complying with applicable laws, platform terms, and usage limits.
+This Actor is designed for legitimate data collection from publicly available Airbnb search result pages. Users are responsible for using the data responsibly and complying with applicable laws, website terms, and privacy requirements.
