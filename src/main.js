@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
-import { gotScraping } from 'got-scraping';
+import { Impit } from 'impit';
 
 const STAYS_SEARCH_OPERATION_NAME = 'StaysSearch';
 const DEFAULT_STAYS_SEARCH_OPERATION_ID = '753d97c7b19a1a402d2fa63882ff4d6802004d11f2499647deef923a19a1641a';
@@ -15,17 +15,13 @@ const PROGRESS_LOG_INTERVAL_PAGES = 5;
 const AUTO_MAX_PAGES_MIN = 12;
 const AUTO_MAX_PAGES_MAX = 200;
 const API_REQUEST_MAX_ATTEMPTS = 4;
+const API_BOOTSTRAP_MAX_ATTEMPTS = 3;
 const API_REQUEST_RETRY_BASE_MS = 2000;
 const API_REQUEST_MIN_DELAY_MS = 1400;
 const API_REQUEST_MAX_DELAY_MS = 3200;
 const API_RATE_LIMIT_MIN_DELAY_MS = 12000;
 const API_RATE_LIMIT_MAX_DELAY_MS = 45000;
-
-const AIRBNB_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
-const AIRBNB_DESKTOP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
-const AIRBNB_ANDROID_APP_USER_AGENT = 'okhttp/4.12.0';
 const AIRBNB_BASE_ORIGIN = 'https://www.airbnb.com';
-const AIRBNB_FALLBACK_SEARCH_URL = `${AIRBNB_BASE_ORIGIN}/s/London--United-Kingdom/homes`;
 const MAX_URL_EXTRACTION_DEPTH = 3;
 const URL_WRAPPER_PARAM_KEYS = ['url', 'u', 'q', 'target', 'dest', 'destination', 'redirect', 'next', 'continue'];
 const HEALABLE_HEADER_DEFAULTS = {
@@ -135,15 +131,6 @@ const getCaseInsensitiveEntry = (object, key) => {
 
 const getCaseInsensitiveValue = (object, key) => getCaseInsensitiveEntry(object, key)?.[1];
 
-const getPathCaseInsensitive = (object, path) => {
-    let current = object;
-    for (const key of path) {
-        current = getCaseInsensitiveValue(current, key);
-        if (current === undefined || current === null) return undefined;
-    }
-
-    return current;
-};
 
 const getRawParamAlias = (name) => {
     const normalized = cleanString(name);
@@ -337,8 +324,12 @@ const normalizeInputUrls = ({ urls, url }) => {
     const seen = new Set();
     for (const candidate of candidates) {
         const extracted = extractAirbnbUrlCandidate(candidate);
-        const resilient = extracted || buildSearchUrlFromLooseText(candidate) || AIRBNB_FALLBACK_SEARCH_URL;
-        if (!resilient || seen.has(resilient)) continue;
+        const resilient = extracted || buildSearchUrlFromLooseText(candidate);
+        if (!resilient) {
+            log.warning('Skipped an invalid Airbnb URL input.');
+            continue;
+        }
+        if (seen.has(resilient)) continue;
         seen.add(resilient);
         normalized.push({
             inputValue: candidate,
@@ -415,29 +406,93 @@ const loadLocalInputFallback = async () => {
     }
 };
 
-const maybeProxyUrl = async (proxyConfiguration) => {
-    if (!proxyConfiguration) return undefined;
-    return proxyConfiguration.newUrl();
+const isTransientError = (error) => {
+    const statusCode = Number(error?.statusCode || error?.response?.statusCode);
+    if (statusCode === 408 || statusCode === 429 || statusCode >= 500) return true;
+
+    const code = cleanString(error?.code)?.toUpperCase();
+    if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND'].includes(code)) return true;
+
+    const text = cleanString(error?.message)?.toLowerCase() || '';
+    return text.includes('timeout') || text.includes('timed out') || text.includes('socket hang up');
 };
 
-const fetchText = async ({ url, proxyConfiguration, accept = 'text/html,application/xhtml+xml' }) => gotScraping.get(url, {
-    proxyUrl: await maybeProxyUrl(proxyConfiguration),
-    headers: {
-        'user-agent': AIRBNB_USER_AGENT,
-        accept,
-        'accept-language': 'en-US,en;q=0.9',
-        'sec-fetch-site': 'none',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-user': '?1',
-        'sec-fetch-dest': 'document',
-    },
-    timeout: { request: 30000 },
-    retry: { limit: 2 },
-    useHeaderGenerator: false,
-});
+const isRateLimitError = (error) => Number(error?.statusCode || error?.response?.statusCode) === 429;
+
+const getHeaderValue = (headers, name) => {
+    if (!headers) return undefined;
+    if (typeof headers.get === 'function') return headers.get(name);
+
+    const expected = name.toLowerCase();
+    const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === expected);
+    return entry?.[1];
+};
+
+const getRetryDelayMs = (attempt, error) => {
+    const rawRetryAfter = getHeaderValue(error?.response?.headers, 'retry-after')
+        || getHeaderValue(error?.headers, 'retry-after');
+    const retryAfter = Number(rawRetryAfter);
+    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+        return Math.min(retryAfter * 1000, API_RATE_LIMIT_MAX_DELAY_MS);
+    }
+
+    if (isRateLimitError(error)) {
+        return randomInt(API_RATE_LIMIT_MIN_DELAY_MS, API_RATE_LIMIT_MAX_DELAY_MS);
+    }
+
+    const base = API_REQUEST_RETRY_BASE_MS * (2 ** (attempt - 1));
+    return randomInt(base, Math.min(base * 2, 12000));
+};
+
+const fetchText = async ({ client, url, accept = 'text/html,application/xhtml+xml' }) => {
+    let lastError;
+
+    for (let attempt = 1; attempt <= API_BOOTSTRAP_MAX_ATTEMPTS; attempt++) {
+        try {
+            const response = await client.fetch(url, {
+                method: 'GET',
+                headers: {
+                    accept,
+                    'accept-language': 'en-US,en;q=0.9',
+                    ...(accept.includes('text/html') && {
+                        'sec-fetch-site': 'none',
+                        'sec-fetch-mode': 'navigate',
+                        'sec-fetch-user': '?1',
+                        'sec-fetch-dest': 'document',
+                    }),
+                },
+            });
+
+            const body = await response.text();
+            if (!response.ok) {
+                const error = new Error(`HTTP ${response.status} when fetching ${url}`);
+                error.statusCode = response.status;
+                error.headers = response.headers;
+                error.responseBody = body;
+                throw error;
+            }
+
+            return {
+                body,
+                statusCode: response.status,
+                headers: response.headers,
+            };
+        } catch (error) {
+            lastError = error;
+        }
+
+        if (!isTransientError(lastError) || attempt >= API_BOOTSTRAP_MAX_ATTEMPTS) break;
+
+        const delayMs = getRetryDelayMs(attempt, lastError);
+        log.warning(`Temporary Airbnb bootstrap failure (${lastError.message}); retrying in ${delayMs}ms.`);
+        await sleep(delayMs);
+    }
+
+    throw lastError || new Error('Airbnb bootstrap request failed.');
+};
 
 const extractApiKeyFromHtml = (html) => {
-    const match = html.match(/"api_config"\s*:\s*\{[\s\S]{0,600}?"key"\s*:\s*"([^"]+)"/i);
+    const match = html.match(/"api[_-]?config"\s*:\s*\{[\s\S]{0,4000}?"key"\s*:\s*"([^"]+)"/i);
     return cleanString(match?.[1]);
 };
 
@@ -502,7 +557,7 @@ const extractScriptUrls = (html, baseUrl) => {
     return Array.from(urls);
 };
 
-const discoverOperationIdFromBootstrap = async ({ operationName, bootstrapHtml, bootstrapUrl, proxyConfiguration }) => {
+const discoverOperationIdFromBootstrap = async ({ client, operationName, bootstrapHtml, bootstrapUrl }) => {
     const fromHtml = findOperationHashNearText(bootstrapHtml, operationName);
     if (fromHtml) return fromHtml;
 
@@ -510,8 +565,8 @@ const discoverOperationIdFromBootstrap = async ({ operationName, bootstrapHtml, 
     for (const scriptUrl of scriptUrls.slice(0, 24)) {
         try {
             const response = await fetchText({
+                client,
                 url: scriptUrl,
-                proxyConfiguration,
                 accept: '*/*',
             });
             const discovered = findOperationHashNearText(response.body, operationName);
@@ -569,7 +624,7 @@ const buildHeaderFallbacksForMissing = ({ missingHeaders = [], referer }) => {
     for (const headerName of missingHeaders) {
         const normalized = normalizeHeaderName(headerName);
         if (!normalized) continue;
-        if (normalized === 'referer') out[normalized] = referer || AIRBNB_FALLBACK_SEARCH_URL;
+        if (normalized === 'referer') out[normalized] = referer || AIRBNB_BASE_ORIGIN;
         else if (normalized === 'origin') out[normalized] = origin;
         else if (HEALABLE_HEADER_DEFAULTS[normalized]) out[normalized] = HEALABLE_HEADER_DEFAULTS[normalized];
     }
@@ -584,7 +639,7 @@ const buildSeedUrl = ({ url }) => {
     const inferred = buildSearchUrlFromLooseText(url);
     if (inferred) return inferred;
 
-    return AIRBNB_FALLBACK_SEARCH_URL;
+    return AIRBNB_BASE_ORIGIN;
 };
 
 const buildRawParamsFromInput = ({ url, adults }) => {
@@ -829,7 +884,6 @@ const mergeHeaders = (...maps) => {
 
 const buildRequestHeaderProfiles = ({ apiKey, referer, headerHints }) => {
     const base = {
-        'user-agent': AIRBNB_USER_AGENT,
         'x-airbnb-api-key': apiKey,
         accept: 'application/json',
         'accept-language': 'en-US,en;q=0.9',
@@ -850,12 +904,6 @@ const buildRequestHeaderProfiles = ({ apiKey, referer, headerHints }) => {
 
     return [
         mergeHeaders(base, HEALABLE_HEADER_DEFAULTS, softBrowserHeaders, headerHints),
-        mergeHeaders(base, { 'user-agent': AIRBNB_DESKTOP_USER_AGENT }, HEALABLE_HEADER_DEFAULTS, softBrowserHeaders, headerHints),
-        mergeHeaders(base, {
-            'user-agent': AIRBNB_ANDROID_APP_USER_AGENT,
-            'accept-language': 'en-US',
-            'x-requested-with': 'com.airbnb.android',
-        }, headerHints),
     ];
 };
 
@@ -866,6 +914,7 @@ const parseResponseError = ({ response, fallbackMessage }) => {
     } catch {
         const error = new Error(`${fallbackMessage} (HTTP ${response.statusCode}).`);
         error.statusCode = response.statusCode;
+        error.headers = response.headers;
         error.responseBody = response.body;
         return error;
     }
@@ -873,6 +922,7 @@ const parseResponseError = ({ response, fallbackMessage }) => {
     if (response.statusCode >= 400) {
         const error = new Error(`Airbnb API returned HTTP ${response.statusCode}.`);
         error.statusCode = response.statusCode;
+        error.headers = response.headers;
         error.responseBody = response.body;
         error.payload = json;
         return error;
@@ -881,6 +931,7 @@ const parseResponseError = ({ response, fallbackMessage }) => {
     if (Array.isArray(json?.errors) && json.errors.length) {
         const error = new Error('Airbnb API returned GraphQL errors.');
         error.statusCode = response.statusCode;
+        error.headers = response.headers;
         error.responseBody = response.body;
         error.payload = json;
         return error;
@@ -889,49 +940,23 @@ const parseResponseError = ({ response, fallbackMessage }) => {
     return { json };
 };
 
-const isTransientError = (error) => {
-    const statusCode = Number(error?.statusCode || error?.response?.statusCode);
-    if (statusCode === 408 || statusCode === 429 || statusCode >= 500) return true;
-
-    const code = cleanString(error?.code)?.toUpperCase();
-    if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND'].includes(code)) return true;
-
-    const text = cleanString(error?.message)?.toLowerCase() || '';
-    return text.includes('timeout') || text.includes('timed out') || text.includes('socket hang up');
-};
-
-const isRateLimitError = (error) => Number(error?.statusCode || error?.response?.statusCode) === 429;
-
-const getRetryDelayMs = (attempt, error) => {
-    const retryAfter = Number(error?.response?.headers?.['retry-after'] || error?.headers?.['retry-after']);
-    if (Number.isFinite(retryAfter) && retryAfter > 0) {
-        return Math.min(retryAfter * 1000, API_RATE_LIMIT_MAX_DELAY_MS);
-    }
-
-    if (isRateLimitError(error)) {
-        return randomInt(API_RATE_LIMIT_MIN_DELAY_MS, API_RATE_LIMIT_MAX_DELAY_MS);
-    }
-
-    const base = API_REQUEST_RETRY_BASE_MS * (2 ** (attempt - 1));
-    return randomInt(base, Math.min(base * 2, 12000));
-};
-
-const requestWithBackoff = async ({ url, proxyConfiguration, headers }) => {
+const requestWithBackoff = async ({ client, url, headers }) => {
     let lastError;
 
     for (let attempt = 1; attempt <= API_REQUEST_MAX_ATTEMPTS; attempt++) {
         try {
-            const response = await gotScraping.get(url, {
-                proxyUrl: await maybeProxyUrl(proxyConfiguration),
+            const response = await client.fetch(url, {
+                method: 'GET',
                 headers,
-                timeout: { request: 45000 },
-                retry: { limit: 0 },
-                throwHttpErrors: false,
-                useHeaderGenerator: false,
             });
 
+            const bodyText = await response.text();
             const parsed = parseResponseError({
-                response,
+                response: {
+                    statusCode: response.status,
+                    body: bodyText,
+                    headers: response.headers,
+                },
                 fallbackMessage: 'Invalid JSON from Airbnb API',
             });
 
@@ -951,7 +976,7 @@ const requestWithBackoff = async ({ url, proxyConfiguration, headers }) => {
     throw lastError || new Error('Airbnb API request failed.');
 };
 
-const requestJson = async ({ url, apiKey, proxyConfiguration, referer, headerHints = {} }) => {
+const requestJson = async ({ client, url, apiKey, referer, headerHints = {} }) => {
     const profiles = buildRequestHeaderProfiles({ apiKey, referer, headerHints });
     const attempted = new Set();
     let lastError;
@@ -962,7 +987,7 @@ const requestJson = async ({ url, apiKey, proxyConfiguration, referer, headerHin
         attempted.add(signature);
 
         try {
-            return await requestWithBackoff({ url, proxyConfiguration, headers });
+            return await requestWithBackoff({ client, url, headers });
         } catch (error) {
             lastError = error;
             if (isTransientError(error)) {
@@ -1017,19 +1042,25 @@ const isHeaderIssue = (error) => {
 };
 
 const getStaysSearchResults = (json, sourceLabel) => {
-    const results = getPathCaseInsensitive(json, ['data', 'presentation', 'staysSearch', 'results']);
+    const data = getCaseInsensitiveValue(json, 'data');
+    const presentation = getCaseInsensitiveValue(data, 'presentation');
+    const staysSearch = getCaseInsensitiveValue(presentation, 'staysSearch');
+    const results = getCaseInsensitiveValue(staysSearch, 'results');
     if (results && typeof results === 'object') return results;
 
-    const rootKeys = json && typeof json === 'object' ? Object.keys(json).join(', ') : typeof json;
-    log.warning(`[${sourceLabel}] Airbnb API response did not include staysSearch results. Top-level keys: ${rootKeys || 'none'}.`);
-    return {};
+    const keys = (value) => value && typeof value === 'object' ? Object.keys(value).join(', ') : 'none';
+    log.warning(
+        `[${sourceLabel}] Airbnb API response did not include staysSearch results. `
+        + `Top-level keys: ${keys(json)}; data keys: ${keys(data)}; `
+        + `presentation keys: ${keys(presentation)}; staysSearch keys: ${keys(staysSearch)}.`,
+    );
+    return undefined;
 };
 
-const getBootstrapData = async ({ seedUrl, proxyConfiguration }) => {
+const getBootstrapData = async ({ client, seedUrl }) => {
     const candidates = Array.from(new Set([
         cleanString(seedUrl),
         extractAirbnbUrlCandidate(seedUrl),
-        AIRBNB_FALLBACK_SEARCH_URL,
         `${AIRBNB_BASE_ORIGIN}/`,
     ].filter(Boolean)));
 
@@ -1037,13 +1068,19 @@ const getBootstrapData = async ({ seedUrl, proxyConfiguration }) => {
 
     for (const url of candidates) {
         try {
-            const response = await fetchText({ url, proxyConfiguration });
+            const response = await fetchText({ client, url });
             const html = response.body;
             const apiKey = extractApiKeyFromHtml(html);
             const deferredVariables = extractDeferredVariables(html);
             const headerHints = extractHeaderHintsFromHtml(html, url);
             if (!firstSuccessful) firstSuccessful = {
-                html, url, apiKey, deferredVariables, headerHints,
+                html,
+                url,
+                apiKey,
+                deferredVariables,
+                headerHints,
+                statusCode: response.statusCode,
+                contentType: getHeaderValue(response.headers, 'content-type'),
             };
             if (apiKey) return {
                 html, url, apiKey, deferredVariables, headerHints,
@@ -1053,13 +1090,21 @@ const getBootstrapData = async ({ seedUrl, proxyConfiguration }) => {
         }
     }
 
-    if (firstSuccessful) return firstSuccessful;
+    if (firstSuccessful) {
+        const hasApiConfigMarker = /"api[_-]?config"/i.test(firstSuccessful.html);
+        log.warning(
+            `Airbnb bootstrap did not expose api_config.key (status=${firstSuccessful.statusCode}, `
+            + `content_type=${firstSuccessful.contentType || 'unknown'}, bytes=${firstSuccessful.html.length}, `
+            + `api_config=${hasApiConfigMarker ? 'present' : 'absent'}).`,
+        );
+        return firstSuccessful;
+    }
     throw new Error('Unable to load Airbnb bootstrap page data.');
 };
 
 const refreshAirbnbApiContext = async ({
+    client,
     seedUrl,
-    proxyConfiguration,
     existingContext = {},
     refreshHash = true,
     refreshKey = true,
@@ -1074,7 +1119,7 @@ const refreshAirbnbApiContext = async ({
         headerHints: mergeHeaders(existingContext.headerHints),
     };
 
-    const bootstrap = await getBootstrapData({ seedUrl, proxyConfiguration });
+    const bootstrap = await getBootstrapData({ client, seedUrl });
     context.bootstrapUrl = bootstrap.url;
     context.deferredVariables = bootstrap.deferredVariables;
 
@@ -1084,10 +1129,10 @@ const refreshAirbnbApiContext = async ({
 
     if (refreshHash || !context.staysSearchOperationId) {
         const discoveredHash = await discoverOperationIdFromBootstrap({
+            client,
             operationName: STAYS_SEARCH_OPERATION_NAME,
             bootstrapHtml: bootstrap.html,
             bootstrapUrl: bootstrap.url,
-            proxyConfiguration,
         });
         context.staysSearchOperationId = discoveredHash || context.staysSearchOperationId;
     }
@@ -1214,12 +1259,12 @@ const buildDedupKey = (mapped) => {
 };
 
 const fetchListings = async ({
+    client,
     targetCount,
     maxPages,
     locale,
     currency,
     apiContext,
-    proxyConfiguration,
     searchContext,
     seedUrl,
     baseVariables,
@@ -1249,10 +1294,11 @@ const fetchListings = async ({
     let maxObservedItemsOffset = 0;
     let syntheticProbeCount = 0;
     let consecutiveNoNewPages = 0;
+    let missingResultsRecoveryAttempted = false;
     let currentCursor;   // undefined = first page (no cursor)
     let page = 1;
 
-    while (rows.length < targetCount && page <= maxPages) {
+    while (persistedCount < targetCount && page <= maxPages) {
         // Mark current cursor used so we never re-request the same page.
         visitedCursorKeys.add(getCursorKey(currentCursor));
 
@@ -1263,6 +1309,7 @@ const fetchListings = async ({
         const variables = buildVariablesForPage(baseVariables, currentCursor);
 
         const runRequest = async () => requestJson({
+            client,
             url: buildSearchUrl({
                 locale,
                 currency,
@@ -1270,7 +1317,6 @@ const fetchListings = async ({
                 operationId: apiContext.staysSearchOperationId,
             }),
             apiKey: apiContext.apiKey,
-            proxyConfiguration,
             referer: apiContext.bootstrapUrl || seedUrl,
             headerHints: apiContext.headerHints,
         });
@@ -1289,8 +1335,8 @@ const fetchListings = async ({
             const previousKey = apiContext.apiKey;
             const previousHeaders = JSON.stringify(apiContext.headerHints || {});
             const refreshed = await refreshAirbnbApiContext({
+                client,
                 seedUrl,
-                proxyConfiguration,
                 existingContext: apiContext,
                 refreshHash,
                 refreshKey,
@@ -1310,7 +1356,27 @@ const fetchListings = async ({
             json = await runRequest();
         }
 
-        const results = getStaysSearchResults(json, sourceLabel);
+        let results = getStaysSearchResults(json, sourceLabel);
+        if (!results && !missingResultsRecoveryAttempted) {
+            missingResultsRecoveryAttempted = true;
+            log.warning(`[${sourceLabel}] Refreshing Airbnb context after an unexpected result shape.`);
+            const refreshed = await refreshAirbnbApiContext({
+                client,
+                seedUrl,
+                existingContext: apiContext,
+                refreshHash: true,
+                refreshKey: true,
+                refreshHeaders: true,
+            });
+            Object.assign(apiContext, refreshed);
+            json = await runRequest();
+            results = getStaysSearchResults(json, sourceLabel);
+        }
+        if (!results) {
+            log.warning(`[${sourceLabel}] Stopping source because Airbnb returned no usable staysSearch results.`);
+            break;
+        }
+
         const items = asArray(getCaseInsensitiveValue(results, 'searchResults'));
 
         const currentCursorPayload = decodeCursorPayload(currentCursor);
@@ -1453,10 +1519,37 @@ const createBatchSaver = ({ globalSeenListingKeys, resultsWanted, savedState }) 
 
     return accepted.length;
 };
+const resolveProxyConfiguration = async (proxyConfiguration) => {
+    if (!proxyConfiguration) return undefined;
+
+    const isApifyCloud = Actor.isAtHome();
+    const hasApifyToken = Boolean(process.env.APIFY_TOKEN);
+    const shouldUseApifyProxy = Boolean(proxyConfiguration?.useApifyProxy);
+    const hasCustomProxyUrls = Array.isArray(proxyConfiguration?.proxyUrls) && proxyConfiguration.proxyUrls.length > 0;
+
+    if (hasCustomProxyUrls) {
+        return Actor.createProxyConfiguration(proxyConfiguration);
+    }
+
+    if (shouldUseApifyProxy) {
+        if (isApifyCloud || hasApifyToken) {
+            try {
+                return await Actor.createProxyConfiguration(proxyConfiguration);
+            } catch (error) {
+                log.warning(`Could not initialize Apify Proxy: ${error.message}`);
+                return undefined;
+            }
+        }
+        log.warning('Apify Proxy requested but running outside Apify platform without APIFY_TOKEN. Continuing without proxy.');
+        return undefined;
+    }
+
+    return undefined;
+};
 
 await Actor.main(async () => {
     const actorInput = (await Actor.getInput()) || {};
-    const fallbackInput = await loadLocalInputFallback();
+    const fallbackInput = Actor.isAtHome() ? {} : await loadLocalInputFallback();
     const input = {
         ...fallbackInput,
         ...actorInput,
@@ -1483,7 +1576,19 @@ await Actor.main(async () => {
         }
     }
 
-    const proxyConfig = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : undefined;
+    const proxyConfig = await resolveProxyConfiguration(proxyConfiguration);
+    const proxyUrl = proxyConfig ? await proxyConfig.newUrl() : undefined;
+    if (proxyUrl) {
+        log.info('Proxy initialized successfully for HTTP client session.');
+    } else {
+        log.warning('Running without proxy. Airbnb requires residential proxies for reliable access.');
+    }
+
+    const client = new Impit({
+        browser: 'ios18',
+        timeout: 45000,
+        ...(proxyUrl && { proxyUrl }),
+    });
 
     const resultsWanted = safePositiveInt(resultsWantedInput, 20);
     log.info(`Starting scrape: resultsWanted=${resultsWanted}, sources=${inputUrls.length}.`);
@@ -1491,8 +1596,8 @@ await Actor.main(async () => {
     const firstSourceSeed = buildSeedUrl({ url: inputUrls[0].runtimeUrl });
 
     const apiContext = await refreshAirbnbApiContext({
+        client,
         seedUrl: firstSourceSeed,
-        proxyConfiguration: proxyConfig,
         existingContext: {
             staysSearchOperationId: DEFAULT_STAYS_SEARCH_OPERATION_ID,
         },
@@ -1518,14 +1623,17 @@ await Actor.main(async () => {
 
         try {
             // Refresh source bootstrap/deferred variables while retaining healed API context.
-            const sourceContext = await refreshAirbnbApiContext({
-                seedUrl: sourceSeedUrl,
-                proxyConfiguration: proxyConfig,
-                existingContext: apiContext,
-                refreshHash: false,
-                refreshKey: false,
-                refreshHeaders: false,
-            });
+            // The initial bootstrap already contains this source's variables; avoid repeating it.
+            const sourceContext = i === 0
+                ? apiContext
+                : await refreshAirbnbApiContext({
+                    client,
+                    seedUrl: sourceSeedUrl,
+                    existingContext: apiContext,
+                    refreshHash: false,
+                    refreshKey: false,
+                    refreshHeaders: false,
+                });
 
             Object.assign(apiContext, sourceContext);
 
@@ -1543,12 +1651,12 @@ await Actor.main(async () => {
             });
 
             const sourceResult = await fetchListings({
+                client,
                 targetCount: remainingTarget,
                 maxPages: sourceMaxPages,
                 locale: cleanString(locale) || DEFAULT_LOCALE,
                 currency: cleanString(currency) || DEFAULT_CURRENCY,
                 apiContext,
-                proxyConfiguration: proxyConfig,
                 searchContext: source.runtimeUrl || sourceSeedUrl || source.inputValue,
                 seedUrl: sourceSeedUrl,
                 baseVariables,

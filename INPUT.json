@@ -2,5 +2,11 @@
   "urls": [
     "https://www.airbnb.com/s/London--United-Kingdom/homes?checkin=2026-05-13&checkout=2026-05-14&adults=1"
   ],
-  "results_wanted": 20
+  "results_wanted": 20,
+  "proxyConfiguration": {
+    "useApifyProxy": true,
+    "apifyProxyGroups": [
+      "RESIDENTIAL"
+    ]
+  }
 }
