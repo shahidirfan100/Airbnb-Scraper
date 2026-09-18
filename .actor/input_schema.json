@@ -28,7 +28,7 @@
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Select proxies to be used by your crawler. Airbnb requires residential proxies for reliable access.",
+      "description": "Optional Apify Proxy settings. Enable residential routing manually when needed.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": false

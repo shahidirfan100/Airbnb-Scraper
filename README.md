@@ -62,7 +62,7 @@ This Airbnb scraper is useful for short-term rental market research, competitor 
 |-----------|------|----------|---------|-------------|
 | `urls` | Array of strings | No | London search URL prefill | One or more Airbnb `/s/.../homes` search URLs. The Actor processes the URLs until `results_wanted` is reached or all sources are exhausted. |
 | `results_wanted` | Integer | No | `20` | Maximum number of unique listing records to save. Minimum value is `1`. |
-| `proxyConfiguration` | Object | No | `{ "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"] }` | Optional Apify Proxy settings; residential routing is recommended for reliable Airbnb access. |
+| `proxyConfiguration` | Object | No | `{ "useApifyProxy": false }` | Optional Apify Proxy settings. Enable residential routing manually when needed. |
 
 ## Output Data
 
@@ -139,7 +139,10 @@ Use Apify Proxy settings when running larger Airbnb collection jobs:
   ],
   "results_wanted": 100,
   "proxyConfiguration": {
-    "useApifyProxy": true
+    "useApifyProxy": true,
+    "apifyProxyGroups": [
+      "RESIDENTIAL"
+    ]
   }
 }
 ```
@@ -187,7 +190,7 @@ Use Apify Proxy settings when running larger Airbnb collection jobs:
 - Use separate URLs for different cities, neighborhoods, date ranges, or guest counts.
 - Keep date filters realistic when collecting pricing and availability snapshots.
 - Increase `results_wanted` gradually for larger markets.
-- The default schema uses Apify Residential Proxy when available; keep proxy routing enabled for larger or scheduled collection jobs.
+- Proxy routing is disabled by default; enable Apify Residential Proxy manually when a run needs it.
 - If some fields are missing, check the original Airbnb search results. Not every listing publishes the same details in search.
 
 ## Integrations

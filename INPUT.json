@@ -4,9 +4,6 @@
   ],
   "results_wanted": 20,
   "proxyConfiguration": {
-    "useApifyProxy": true,
-    "apifyProxyGroups": [
-      "RESIDENTIAL"
-    ]
+    "useApifyProxy": false
   }
 }
